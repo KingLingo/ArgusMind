@@ -37,6 +37,19 @@
 </p>
 <p align="center"><sub>漏洞详情（报告与代码审计链路图）</sub></p>
 
+
+## 交流群
+
+扫码加入微信 **ArgusMind交流群**，交流使用问题等。
+
+<p align="center">
+  <img src="docs/0bf202122d90d69a1c51c0a053b94342.jpg" alt="ArgusMind 微信交流群二维码" width="280" />
+</p>
+
+<p align="center"><sub>微信群二维码有时效（约 7 天）</sub></p>
+
+
+
 ## 核心能力
 
 - **端到端审计流水线**：`Orchestrator` 编排 `ProjectInfo` → `Plan` → `SinkFinder` → `ChainAnalyzer` 等 Agent，支持任务暂停、恢复与取消。
