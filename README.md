@@ -63,6 +63,13 @@
 
 ArgusMind 采用 **分层 + 事件驱动 + 双库分工** 的设计：HTTP 层负责鉴权与任务调度；`Orchestrator` 驱动多 Agent 流水线；审计过程产生的 **图结构** 写入 Neo4j，**作业元数据、配置、日志、事件、发现** 写入 PostgreSQL；运行时通过内存 **事件总线** 解耦编排与持久化。
 
+<p align="center">
+  <img src="docs/架构图.png" alt="ArgusMind 系统架构总览" width="96%" />
+</p>
+<p align="center"><sub>系统架构总览（用户访问 → 调度服务 → 核心编排 → Agent → 工具 → 双库，及外部依赖）</sub></p>
+
+下文各小节为分模块的 Mermaid 细化图，可与上图对照阅读。
+
 ### 总体分层
 
 ```mermaid
