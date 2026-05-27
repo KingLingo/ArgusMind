@@ -32,4 +32,7 @@ PY
   done
 fi
 
+echo "[entrypoint] 启动 Nginx（前端静态资源 + /api 反代）..."
+nginx
+
 exec "$@"

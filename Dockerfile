@@ -1,4 +1,15 @@
-# ArgusMind API — Python 3.11 + Node（OpenCode / npx 工具链）+ ripgrep
+# ArgusMind 单容器：前端（Nginx）+ 后端（FastAPI）
+FROM node:20-bookworm-slim AS frontend-builder
+
+WORKDIR /frontend
+
+COPY frontend/package*.json ./
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install
+
+COPY frontend ./
+RUN npm run build
+
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -13,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         ripgrep \
         git \
+        nginx \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
@@ -55,8 +67,11 @@ RUN mkdir -p /app/work /app/data/repos
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+COPY docker/nginx.single.conf /etc/nginx/conf.d/default.conf
+COPY --from=frontend-builder /frontend/dist /usr/share/nginx/html
 
 EXPOSE 6066
+EXPOSE 80
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "-m", "src.main"]

@@ -1,4 +1,4 @@
-# ArgusMind 一键部署：PostgreSQL + Neo4j + API
+# ArgusMind 一键部署：PostgreSQL + Neo4j + 单容器前后端
 # 使用方式：./install.sh  或  .\install.ps1
 
 name: argusmind
@@ -82,6 +82,7 @@ services:
       TZ: Asia/Shanghai
     ports:
       - "${ARGUSMIND_PORT:-6066}:6066"
+      - "${ARGUSMIND_UI_PORT:-8006}:80"
     volumes:
       # 将被测代码库挂载到此目录，在 API 中注册项目时使用容器内路径，例如 /data/repos/my-project
       - ${DATA_DIR:-./data}/repos:/data/repos

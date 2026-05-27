@@ -14,7 +14,6 @@ __pycache__
 docs/
 test_dir/
 tests/
-frontend/
 .env
 config.yaml
 work/
