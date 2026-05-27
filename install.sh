@@ -63,10 +63,30 @@ set -a
 set +a
 DATA_DIR="${DATA_DIR:-./data}"
 PORT="${ARGUSMIND_PORT:-6066}"
+UI_PORT="${ARGUSMIND_UI_PORT:-8006}"
 
-# 去掉 ./ 前缀，统一为相对项目根的路径
-DATA_DIR="${DATA_DIR#./}"
-mkdir -p "$ROOT/$DATA_DIR/postgres" "$ROOT/$DATA_DIR/neo4j" "$ROOT/$DATA_DIR/work" "$ROOT/$DATA_DIR/repos"
+# 规范 DATA_DIR：
+# - 相对路径统一补全为 ./ 前缀（避免 compose 误判为命名卷）
+# - 绝对路径保持不变
+if [[ "$DATA_DIR" != /* && "$DATA_DIR" != ./* ]]; then
+  DATA_DIR="./$DATA_DIR"
+fi
+
+if [[ "$DATA_DIR" == /* ]]; then
+  HOST_DATA_DIR="$DATA_DIR"
+else
+  HOST_DATA_DIR="$ROOT/${DATA_DIR#./}"
+fi
+
+mkdir -p "$HOST_DATA_DIR/postgres" "$HOST_DATA_DIR/neo4j" "$HOST_DATA_DIR/work" "$HOST_DATA_DIR/repos"
+
+# 确保前端子模块已拉取，避免镜像内出现 Nginx 默认页
+if [[ -f "$ROOT/.gitmodules" ]]; then
+  if [[ ! -f "$ROOT/frontend/package.json" ]]; then
+    info "初始化前端子模块 frontend ..."
+    git submodule update --init --recursive frontend || err "前端子模块初始化失败，请检查网络或仓库权限"
+  fi
+fi
 
 info "构建并启动服务（PostgreSQL + Neo4j + API）..."
 "${COMPOSE[@]}" -f docker-compose.yml up -d --build
@@ -88,9 +108,7 @@ cat <<EOF
 ========================================
  ArgusMind 安装完成
 ========================================
- API 地址:     http://localhost:${PORT}
- API 文档:     http://localhost:${PORT}/docs
- 健康检查:     http://localhost:${PORT}/api/ready
+ Web 地址:     http://localhost:${UI_PORT}
 
  默认登录:     用户名 ArgusMind  密码 ArgusMind
  （生产环境请尽快修改密码）

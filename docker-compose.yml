@@ -60,7 +60,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: argusmind:latest
-    container_name: argusmind-api
+    container_name: argusmind
     restart: unless-stopped
     depends_on:
       postgres:
