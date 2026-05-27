@@ -88,19 +88,24 @@ def _install_darwin() -> Tuple[bool, str]:
 
 
 def _install_linux() -> Tuple[bool, str]:
+    sudo_prefix: List[str] = ["sudo", "-n"] if shutil.which("sudo") else []
     if shutil.which("apt-get"):
-        r = _run(["sudo", "-n", "apt-get", "install", "-y", "tokei"], timeout=600.0)
+        r = _run([*sudo_prefix, "apt-get", "install", "-y", "tokei"], timeout=600.0)
         out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
             return True, "已通过 apt 安装 tokei。"
-        return False, f"apt 安装 tokei 失败或需要密码: {out[:500]}"
+        if sudo_prefix and ("password" in out.lower() or "a password is required" in out.lower()):
+            return False, "自动安装 tokei 需要免密 sudo。请手动执行: sudo apt install -y tokei"
+        return False, f"apt 安装 tokei 失败 (code={r.returncode}): {out[:500]}"
 
     if shutil.which("dnf"):
-        r = _run(["sudo", "-n", "dnf", "install", "-y", "tokei"], timeout=600.0)
+        r = _run([*sudo_prefix, "dnf", "install", "-y", "tokei"], timeout=600.0)
         out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
             return True, "已通过 dnf 安装 tokei。"
-        return False, f"dnf 安装 tokei 失败或需要密码: {out[:500]}"
+        if sudo_prefix and ("password" in out.lower() or "a password is required" in out.lower()):
+            return False, "自动安装 tokei 需要免密 sudo。请手动执行: sudo dnf install -y tokei"
+        return False, f"dnf 安装 tokei 失败 (code={r.returncode}): {out[:500]}"
 
     return False, "未识别包管理器（apt/dnf），请手动安装 tokei。"
 

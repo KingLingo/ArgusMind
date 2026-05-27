@@ -148,25 +148,32 @@ def _try_install_darwin() -> Tuple[bool, str]:
 
 
 def _try_install_linux() -> Tuple[bool, str]:
+    sudo_prefix: List[str] = ["sudo", "-n"] if shutil.which("sudo") else []
     if shutil.which("apt-get"):
-        r = _run(["sudo", "-n", "apt-get", "install", "-y", "nodejs", "npm"], timeout=600.0)
+        r = _run([*sudo_prefix, "apt-get", "install", "-y", "nodejs", "npm"], timeout=600.0)
         out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
             _refresh_path_after_node_install()
             return True, "已通过 apt 安装 nodejs/npm。"
-        if r.returncode != 0 and ("password" in out.lower() or "a password is required" in out.lower()):
-            pass
+        if sudo_prefix and (
+            "password" in out.lower() or "a password is required" in out.lower()
+        ):
+            return False, (
+                "自动安装需要免密 sudo。请手动执行: sudo apt update && sudo apt install -y nodejs npm "
+                "或使用 NodeSource / nvm。"
+            )
         return False, (
-            "自动安装需要免密 sudo。请手动执行: sudo apt update && sudo apt install -y nodejs npm "
-            "或使用 NodeSource / nvm。"
+            f"apt 安装失败 (code={r.returncode}): {out[:500]}"
         )
     if shutil.which("dnf"):
-        r = _run(["sudo", "-n", "dnf", "install", "-y", "nodejs", "npm"], timeout=600.0)
+        r = _run([*sudo_prefix, "dnf", "install", "-y", "nodejs", "npm"], timeout=600.0)
         out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
             _refresh_path_after_node_install()
             return True, "已通过 dnf 安装 nodejs/npm。"
-        return False, f"dnf 安装失败或需要密码: {out[:300]}"
+        if sudo_prefix and ("password" in out.lower() or "a password is required" in out.lower()):
+            return False, "自动安装 dnf 需要免密 sudo。请手动执行: sudo dnf install -y nodejs npm"
+        return False, f"dnf 安装失败 (code={r.returncode}): {out[:300]}"
     return False, "未识别包管理器（apt/dnf），请手动安装 Node.js: https://nodejs.org/"
 
 
