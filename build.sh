@@ -9,7 +9,7 @@ info() { echo "[ArgusMind] $*"; }
 err() { echo "[ArgusMind] 错误: $*" >&2; exit 1; }
 
 FRONTEND_DIR="$ROOT/frontend"
-IMAGE_TAG="${1:-argusmind:local}"
+IMAGE_TAG="${1:-argusmind}"
 
 require_git_repo() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || err "当前目录不是 Git 仓库"
