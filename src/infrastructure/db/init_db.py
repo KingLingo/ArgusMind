@@ -287,6 +287,7 @@ def init_neo4j_indexes(config: Config) -> None:
 
 def init_db(config: Config) -> None:
     """初始化数据库：建表 + 种子数据 + Neo4j 索引（幂等可重复运行）"""
+    create_all_tables(config)
     with session_scope() as session:
         seed_default_data(session)
         set_llm_provider(session)
