@@ -30,6 +30,11 @@ jobs:
           git submodule update --init --recursive
           git submodule foreach --recursive "git fetch origin main && git checkout --detach origin/main"
 
+      - name: Build frontend locally
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

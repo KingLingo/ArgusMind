@@ -1,18 +1,4 @@
 # ArgusMind 单容器：前端（Nginx）+ 后端（FastAPI）
-FROM node:20-bookworm-slim AS frontend-builder
-
-WORKDIR /frontend
-
-COPY frontend/package*.json ./
-
-RUN npm config set registry https://registry.npmmirror.com \
-    && npm install
-
-COPY frontend ./
-
-RUN npm run build
-
-
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -73,7 +59,7 @@ RUN rm -f /etc/nginx/sites-enabled/default \
 
 COPY docker/nginx.single.conf /etc/nginx/conf.d/default.conf
 
-COPY --from=frontend-builder /frontend/dist/ /usr/share/nginx/html/
+COPY frontend/dist/ /usr/share/nginx/html/
 
 EXPOSE 6066
 EXPOSE 80
