@@ -95,6 +95,10 @@ def fetch_litellm_provider_list() -> Dict[str, Any]:
             if provider in POPULAR_PROVIDERS:
                 provider_item["provider_type"] = "popular"
             provider_entries[provider] = provider_item
+        logger.info(
+            "[init_db] litellm provider 清单拉取完成: providers=%d",
+            len(provider_entries),
+        )
         return provider_entries
     except Exception as ex:  # pragma: no cover - 离线或 litellm 未装时降级为空
         return {"error": str(ex)}
@@ -162,6 +166,11 @@ def fetch_opencode_provider_list() -> Dict[str, Any]:
                         if provider_id in POPULAR_PROVIDERS:
                             provider_item["provider_type"] = "popular"
                         providers.append(provider_item)
+                logger.info(
+                    "[init_db] opencode provider 清单拉取完成: providers=%d source=%s/provider",
+                    len(providers),
+                    service_url,
+                )
                 return {"providers": providers, "source": f"{service_url}/provider"}
     except Exception as ex:  # pragma: no cover
         return {"providers": [], "error": str(ex)}
@@ -183,6 +192,7 @@ def create_all_tables(config: Config) -> bool:
     created = ensure_database_exists(config)
     engine = init_engine(config.postgres)
     Base.metadata.create_all(engine)
+    logger.info("[init_db] ORM 建表完成: db=%s created=%s", config.postgres.db, created)
     return created
 
 def ensure_database_exists(config: Config) -> bool:
@@ -206,9 +216,20 @@ def ensure_database_exists(config: Config) -> bool:
                 exists = cur.fetchone() is not None
                 if not exists:
                     cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_db)))
+                    logger.info(
+                        "[init_db] 目标数据库不存在，已创建: db=%s via=%s",
+                        target_db,
+                        maintenance_db,
+                    )
                     return True
+                logger.info("[init_db] 目标数据库已存在: db=%s via=%s", target_db, maintenance_db)
                 return False
-        except Exception:
+        except Exception as ex:
+            logger.warning(
+                "[init_db] 使用维护库连接失败，尝试下一个: maintenance_db=%s err=%s",
+                maintenance_db,
+                ex,
+            )
             if maintenance_db == "template1":
                 raise
         finally:
@@ -241,8 +262,12 @@ def seed_default_data(session: Session) -> None:
             display_name="Administrator",
         )
         session.add(user)
+        logger.info("[init_db] 默认用户已创建: username=%s", DEFAULT_USERNAME)
+    else:
+        logger.info("[init_db] 默认用户已存在: username=%s", DEFAULT_USERNAME)
 
     # 默认配置项
+    created_config_count = 0
     for cfg in DEFAULT_CONFIGS:
         row = session.query(ConfigEntry).filter(ConfigEntry.name == cfg["name"]).one_or_none()
         if row is None:
@@ -253,8 +278,14 @@ def seed_default_data(session: Session) -> None:
                 description=cfg.get("description", ""),
             )
             session.add(row)
+            created_config_count += 1
 
     session.flush()
+    logger.info(
+        "[init_db] 默认配置写入完成: created=%d total=%d",
+        created_config_count,
+        len(DEFAULT_CONFIGS),
+    )
 
 
 
@@ -262,6 +293,7 @@ def seed_default_data(session: Session) -> None:
 def _hydrate_provider_list(session: Session, *, name: str, fetcher) -> None:
     row = session.query(ConfigEntry).filter(ConfigEntry.name == name).one_or_none()
     if row is None:
+        logger.info("[init_db] 跳过 provider list 填充：配置项不存在 name=%s", name)
         return
     try:
         fetched = fetcher() or {}
@@ -269,6 +301,11 @@ def _hydrate_provider_list(session: Session, *, name: str, fetcher) -> None:
         logger.warning("[init_db] 拉取 %s 失败: %s", name, ex)
         fetched = {}
     row.value_json = fetched
+    logger.info(
+        "[init_db] provider list 已更新: name=%s empty=%s",
+        name,
+        not bool(fetched),
+    )
 
 
 def init_neo4j_indexes(config: Config) -> None:
@@ -279,6 +316,7 @@ def init_neo4j_indexes(config: Config) -> None:
     client = Neo4jClient(config.neo4j)
     try:
         ensure_neo4j_indexes(client)
+        logger.info("[init_db] Neo4j 索引初始化完成")
     except Exception as ex:
         logger.warning("[init_db] Neo4j 索引初始化失败: %s", ex)
     finally:
@@ -287,8 +325,12 @@ def init_neo4j_indexes(config: Config) -> None:
 
 def init_db(config: Config) -> None:
     """初始化数据库：建表 + 种子数据 + Neo4j 索引（幂等可重复运行）"""
+    logger.info("[init_db] 开始初始化: postgres_db=%s", config.postgres.db)
     create_all_tables(config)
     with session_scope() as session:
+        logger.info("[init_db] 开始写入种子数据")
         seed_default_data(session)
+        logger.info("[init_db] 开始刷新 provider 清单")
         set_llm_provider(session)
     init_neo4j_indexes(config)
+    logger.info("[init_db] 初始化完成")
