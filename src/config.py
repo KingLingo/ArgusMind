@@ -116,7 +116,7 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     return Config(
         neo4j=neo4j,
         postgres=postgres,
-        log_level=str(yaml_data.get("log_level", "INFO")),
+        log_level=str(_resolve("LOG_LEVEL", yaml_data.get("log_level"), "INFO")),
         log_file=Path(log_file_str) if log_file_str else None,
         project_root=_PROJECT_ROOT,
         work_dir=Path(work_dir_str) if work_dir_str else (_PROJECT_ROOT / "work"),

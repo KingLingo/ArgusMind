@@ -9,6 +9,7 @@ from fastapi import FastAPI
 import src.globals as g
 from src.tmp_dir import init_tmp_dir
 from src.config import load_config
+from src.logg import setup_logging
 from src.core.event_handlers import register_default_handlers
 from src.core.task_control import reload_paused_from_db
 from src.infrastructure.db import dispose_engine, init_engine
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     """启动时同时初始化 PostgreSQL 与 Neo4j（幂等），关停时释放连接。"""
     config = load_config()
     app.state.config = config
+    setup_logging(level=config.log_level, log_file=config.log_file)
 
     # 任务临时目录：与 src/main.py 一致；未设置时由 init_tmp_dir 统一 resolve。
     if not str(getattr(g, "TMP_DIR", "") or "").strip():

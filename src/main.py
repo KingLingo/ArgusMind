@@ -10,10 +10,14 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import uvicorn
+from src.config import load_config
+from src.logg import setup_logging
 from src.tmp_dir import init_tmp_dir
 
 if __name__ == "__main__":
     init_tmp_dir()
+    _cfg = load_config()
+    setup_logging(level=_cfg.log_level, log_file=_cfg.log_file)
 
     uvicorn.run(
         "src.api.app:create_app",
