@@ -126,6 +126,7 @@ def test_code_agent_config() -> OkResponse[str]:
         project_path=project_root,
         model_id=runtime_cfg.model_id,
         provider_id=runtime_cfg.provider_id,
+        read_timeout=120.0,
     )
     try:
         sid = tool.create_session()

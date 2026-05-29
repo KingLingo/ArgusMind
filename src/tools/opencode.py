@@ -549,6 +549,21 @@ def _describe_session_status_for_log(status: Dict[str, Any]) -> str:
     return f"会话状态：{stype}"
 
 
+class _SseListenerHandle:
+    """SSE 监听句柄：close() 释放资源并 join 线程；idle_aborted 表示是否因空闲超时主动中止了会话。"""
+
+    def __init__(self, closer: Callable[[], None], state: dict[str, bool]) -> None:
+        self._closer = closer
+        self._state = state
+
+    @property
+    def idle_aborted(self) -> bool:
+        return bool(self._state.get("idle_aborted", False))
+
+    def close(self) -> None:
+        self._closer()
+
+
 def _start_opencode_sse_step_printer(
         client: Opencode,
         session_id: str,
@@ -556,7 +571,8 @@ def _start_opencode_sse_step_printer(
         event_id: Optional[int] = None,
         task_id: str = "",
         base_url: Optional[str] = None,
-) -> Callable[[], None]:
+        idle_timeout_sec: Optional[float] = None,
+) -> "_SseListenerHandle":
     """在后台线程订阅 client.event.list()（SSE），打印 + 持久化与本会话相关的事件。
 
     另起一线程（内建 asyncio 事件循环）每 10s 异步轮询 GET /session/status，
@@ -566,14 +582,20 @@ def _start_opencode_sse_step_printer(
     - event_id：当前 code_agent 调用对应的 events.id；非空时把 SSE 事件持久化到 opencode_events，
       并在每次 step-finish 时实时把累计 token 回写到 events.code_agent_*_delta
     - base_url：OpenCode 服务根地址（默认从 client.base_url 读取）
+    - idle_timeout_sec：空闲超时（秒）。>0 时启用看门狗：若持续该时长未收到任何 SSE 事件，
+      判定会话卡死并调用 session.abort 主动中止，使阻塞中的 chat() 提前返回。
 
-    返回关闭函数：应在 chat 结束后调用以释放连接并 join 线程。
+    返回 _SseListenerHandle：应在 chat 结束后调用 close() 以释放连接并 join 线程；
+    其 idle_aborted 表明本次是否因空闲超时被中止。
     """
     holder: dict[str, Any] = {}
     stop = threading.Event()
     last_fingerprint: Optional[tuple[Any, ...]] = None
     counted_token_fps: set[tuple[Any, ...]] = set()
     persisted_fps: set[tuple[Any, ...]] = set()
+    # 最后一次收到 SSE 事件的单调时钟；idle 看门狗据此判断是否卡死。
+    last_activity: dict[str, float] = {"ts": time.monotonic()}
+    idle_state: dict[str, bool] = {"idle_aborted": False}
 
     # 延迟导入避免与 src.services / config_service 之间的循环依赖。
     if event_id:
@@ -609,6 +631,9 @@ def _start_opencode_sse_step_printer(
             for ev in stream:
                 if stop.is_set():
                     break
+
+                # 收到任意事件即视为有活动，刷新空闲看门狗计时。
+                last_activity["ts"] = time.monotonic()
 
                 fp = _fingerprint_opencode_sse_event(ev)
 
@@ -670,10 +695,36 @@ def _start_opencode_sse_step_printer(
                 except Exception:
                     pass
 
+    def idle_watchdog() -> None:
+        """周期性检查 SSE 是否长时间无事件；超过 idle_timeout_sec 则主动中止会话。"""
+        if not idle_timeout_sec or idle_timeout_sec <= 0:
+            return
+        check_interval = min(5.0, max(1.0, idle_timeout_sec / 2.0))
+        while not stop.is_set():
+            # 可被 closer 的 stop.set() 提前唤醒，避免无谓等待。
+            if stop.wait(check_interval):
+                break
+            idle = time.monotonic() - last_activity["ts"]
+            if idle >= idle_timeout_sec:
+                idle_state["idle_aborted"] = True
+                logger.warning(
+                    "[opencode idle] 会话 %s 已 %.0fs 无 SSE 事件，触发空闲超时，主动中止会话",
+                    session_id,
+                    idle,
+                )
+                try:
+                    client.session.abort(id=session_id)
+                except Exception as ex:
+                    logger.warning("[opencode idle] 中止会话失败: %s", ex)
+                stop.set()
+                break
+
     t = threading.Thread(target=worker, name="opencode-event-sse", daemon=True)
     status_t = threading.Thread(target=status_worker, name="opencode-session-status", daemon=True)
+    idle_t = threading.Thread(target=idle_watchdog, name="opencode-idle-watchdog", daemon=True)
     t.start()
     status_t.start()
+    idle_t.start()
 
     def closer() -> None:
         stop.set()
@@ -685,8 +736,9 @@ def _start_opencode_sse_step_printer(
                 pass
         t.join(timeout=5.0)
         status_t.join(timeout=5.0)
+        idle_t.join(timeout=5.0)
 
-    return closer
+    return _SseListenerHandle(closer, idle_state)
 
 
 def _latest_assistant_text_from_messages(client: Opencode, session_id: str) -> str:
@@ -788,16 +840,26 @@ class OpenCodeTool(BaseTool):
 
         self._process = None
 
+    # read 仅作为"永久挂死"的兜底（秒）：code agent 单轮可能很久，
+    # 因此设得很大，真正的判活交给下面基于 SSE 的空闲超时。
+    DEFAULT_READ_TIMEOUT = 4 * 3600.0
+    # 空闲超时（秒）：实际任务中若长时间收不到任何 SSE 事件，判定卡死并主动中止会话。
+    DEFAULT_IDLE_TIMEOUT = 15 * 60.0
+
     def __init__(
             self,
             max_retries: int = 3,
             model_id: str = "",
             provider_id: str = "",
-            project_path: str = ""
+            project_path: str = "",
+            read_timeout: Optional[float] = DEFAULT_READ_TIMEOUT,
+            idle_timeout: Optional[float] = DEFAULT_IDLE_TIMEOUT,
     ):
         self._name = "OpenCode"
         self._status = False
         self.url = ""
+        self._read_timeout = read_timeout
+        self.idle_timeout = idle_timeout
         if project_path == "":
             logger.error("OpenCode初始化失败，项目路径为空")
             pass
@@ -819,7 +881,9 @@ class OpenCodeTool(BaseTool):
             http_client=httpx.Client(
                 timeout=httpx.Timeout(
                     connect=10.0,
-                    read=None,  # ⭐ 等待直到 AI 完成
+                    # 读超时兜底：AI 任务可能较久，但不能无限等待，
+                    # 否则请求会一直挂起、占满线程池并拖垮其它接口。
+                    read=self._read_timeout,
                     write=10.0,
                     pool=10.0,
                 )
@@ -834,6 +898,15 @@ class OpenCodeTool(BaseTool):
         except Exception as e:
             logger.exception("opencode 初始化探测失败: %s", e)
 
+
+    def _idle_timeout_result(self, session_id: str) -> ToolResult:
+        minutes = int((self.idle_timeout or 0) // 60)
+        return ToolResult(
+            success=False,
+            error=f"code agent 空闲超时：约 {minutes} 分钟无任何进展，已主动中止会话",
+            error_code=ERROR_CODE_EXTERNAL,
+            meta={"session_id": session_id},
+        )
 
     def set_event_id(self, event_id: str):
         self.event_id = event_id
@@ -884,6 +957,7 @@ class OpenCodeTool(BaseTool):
         registry = get_code_agent_run_registry()
         for attempt in range(self.max_retries):
             active_run = None
+            sse_listener: Optional[_SseListenerHandle] = None
             try:
                 if task_id_str:
                     active_run = registry.register(task_id_str, sid, self.client)
@@ -896,13 +970,14 @@ class OpenCodeTool(BaseTool):
                         )
 
                 sse_tokens: dict[str, float] = {"input": 0.0, "output": 0.0, "count": 0.0}
-                close_sse = _start_opencode_sse_step_printer(
+                sse_listener = _start_opencode_sse_step_printer(
                     self.client,
                     sid,
                     token_accumulator=sse_tokens,
                     event_id=run_event_id,
                     task_id=task_id,
                     base_url=self.url,
+                    idle_timeout_sec=self.idle_timeout,
                 )
                 try:
                     response = self.client.session.chat(
@@ -918,7 +993,10 @@ class OpenCodeTool(BaseTool):
                         },
                     )
                 finally:
-                    close_sse()
+                    sse_listener.close()
+
+                if sse_listener.idle_aborted:
+                    return self._idle_timeout_result(sid)
 
                 if task_id_str and registry.is_cancelled(task_id_str):
                     return ToolResult(
@@ -970,6 +1048,10 @@ class OpenCodeTool(BaseTool):
                 logger.debug("opencode 响应 %s", result)
                 return result
             except Exception as e:
+                # 空闲超时主动中止会话往往会让 chat() 抛错，此处优先返回明确的超时结果，
+                # 不再重试（重试也会再次空闲卡死）。
+                if sse_listener is not None and sse_listener.idle_aborted:
+                    return self._idle_timeout_result(sid)
                 if task_id_str and registry.is_cancelled(task_id_str):
                     return ToolResult(
                         success=False,
