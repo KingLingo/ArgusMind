@@ -43,7 +43,7 @@ class ChainConfirmer(BaseAgent):
     逐项验证核心安全假设，输出确认/驳回/待人工复审结论。
     """
     MODULE_NAME = "chain_confirmer"
-    DEFAULT_MAX_ROUNDS = 50
+    DEFAULT_MAX_ROUNDS = 70
     VERDICTS_NEED_CONFIRMATION = {"LIKELY_VULNERABLE"}
 
     def __init__(self, brain: Optional[Brain] = None, max_rounds: int = DEFAULT_MAX_ROUNDS):

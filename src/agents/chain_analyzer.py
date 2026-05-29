@@ -78,7 +78,7 @@ class ChainAnalyzer(BaseAgent):
     多条独立分支，每条分支拥有隔离的对话上下文和 ChainNode 序列。
     """
     MODULE_NAME = "chain_analyzer"
-    DEFAULT_MAX_ROUNDS = 50
+    DEFAULT_MAX_ROUNDS = 70
     VERDICTS_NEED_CONFIRMATION = {"LIKELY_VULNERABLE"}
     VALID_FINAL_VERDICTS = frozenset({
         "LIKELY_VULNERABLE",

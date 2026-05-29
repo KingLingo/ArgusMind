@@ -36,7 +36,7 @@ chain_analyzer_system_prompt = '''
 ## 五维前置条件（每 hop 首要任务：评估经本节点后向上游/Sink 的状态）
 | 维度 | 依赖条件 | 本 hop 须回答 |
 | --- | --- | --- |
-| data | 可控且未被有效 sanitizer/validator 处理 | 向上游暴露形态是否仍可控、可绕过下游约束 |
+| data | **已证实**攻击者可影响且未被有效 sanitizer/validator 处理 | 向上游暴露形态是否仍可控、可绕过下游约束；**禁止**将「若攻击者能控制 X」当作 Survival 依据 |
 | authz | 缺失或可绕过的认证/归属/越权 | 是否新增有效鉴权，或弱化/剥离身份上下文 |
 | state | 缺失或可绕过的状态机/幂等/防重放 | 状态校验是否强且不可绕过，或被宽松化 |
 | concurrency/lifecycle | UAF、双重释放、TOCTOU、未加锁临界区 | 是否引入锁/CAS/状态机，或保留危险窗口 |
@@ -58,8 +58,8 @@ chain_analyzer_system_prompt = '''
 
 ## 阶段 A：内部防护闭合审计（进入阶段 B 的前置条件）
 
-**常见错误**：只判断「入参是否可控」就查 caller —— **不足**。阶段 A 必须同时完成：
-1. **可控性**：与本 Sink 相关的前置条件承载体（参数/字段/状态/句柄）是否仍可能受攻击者影响；
+**常见错误**：只判断「入参是否可控」就查 caller —— **不足**；或把「数据来自 DB」默认当作 Survival 而不追 Writer/写入方 —— **不足**。阶段 A 必须同时完成：
+1. **可控性（须证实，不可假设）**：与本 Sink 相关的前置条件承载体（参数/字段/状态/句柄）是否**已被读码证明**受攻击者影响；来自 DB/缓存/配置时，本 hop 只评「读取后形态」，**用户是否可写**在 Writer hop 或 entry_point 用 `<exploitability_gate>` 结案，禁止在 `detail` 里留「若攻击者能改库表字段」；
 2. **本节点内部防护有效性**：当前 hop 函数体内（及一层内直接 callee）是否存在 sanitizer/validator/authz/state/锁等；若有，须评**是否作用于正确对象、是否可绕过**（空值/类型混淆/竞态窗口/校验对象错误/仅覆盖部分分支等），得出 **有效 / 无效 / 不确定**；
 3. **传递性结论**：经本节点后，至少一项前置条件对 Sink 利用仍有意义 → Survival；全部相关前置条件被不可绕过地破坏 → Pruning。
 
@@ -93,7 +93,12 @@ chain_analyzer_system_prompt = '''
 - 识别逻辑支点（多 caller、多 source、跨媒介）→ 立即 fork/insert，**禁止**同条输出中对分支继续深挖。
 
 ## entry_point
-无直接上游。完成入口验证（外部请求、可控性、鉴权/频控/约束）后**立即** `final_resolution`；禁止查 caller 或正向分析其下游调用。
+无直接上游。**结案前须用读码证据完成入口三连证**（任一项不成立 → `final_resolution` + `SAFE`，勿判 `LIKELY_VULNERABLE`、勿把假设留给二次校验）：
+1. **可达性**：路由/分发/调度能落到**已存在**的目标方法（核对 control/handler 类中确有该 method；`call_user_func`/`loadModule` 等须对照 method 名字符串与类定义）。方法不存在、拼写错误、仅 dead code → **SAFE**。
+2. **触发面**：该入口可被攻击者或不可信方实际触发（HTTP/CLI/Webhook/定时任务对外暴露等）；仅内部运维且与威胁模型无关 → 在 `detail` 说明并倾向 **SAFE**。
+3. **Source 可控性**：进入链路的污点在本入口**已证实**可控（见 `<exploitability_gate>`）。仅写「利用条件：需控制某 DB 字段」但未追到用户可写路径 → **SAFE**。
+
+完成后**立即** `final_resolution`；禁止查 caller 或正向分析其下游调用。
 
 ## 跨媒介（Reader 当前 hop，Writer = 隐式直接上游）
 触发：函数体内从 DB/Redis/MQ/文件/配置/全局变量读取，且结果作为前置条件向上游暴露。
@@ -102,6 +107,21 @@ chain_analyzer_system_prompt = '''
 ## 节点 type
 entry_point | param_source | caller | data_flow | sanitizer | validator | authz | state | config
 </hop_protocol>
+
+<exploitability_gate>
+## 可利用性三连证（判 `LIKELY_VULNERABLE` 的**充分必要条件**）
+二次校验只审「已声称成立」的漏洞；**下列任一项未用读码证据证实，初次分析必须判 `SAFE`**，不得输出「疑似」或把缺口写成「攻击者若能控制…」留给下游。
+
+| 维度 | 须证实的内容 | 未证实时的处理 |
+| --- | --- | --- |
+| 路径可达 | 从 entry 到 Sink 每跳**直接调用/写入-读取**关系已在工具结果或已读代码中对齐；入口 method/路由存在且可执行 | **SAFE**（写明断点：如 method 不存在、分支永不执行） |
+| Source 可控 | 进入 Sink 的数据在利用链上**攻击者可影响**：请求参数/Header/Body、上传、Webhook、可伪造的客户端字段等；或跨媒介时已追到 **Writer** 且证实存在**用户可达的写入**（控制器/API/导入/注册接口等） | **SAFE**（写明：仅配置文件/内置 SQL/无用户写入口） |
+| 防护缺失 | 与本 Sink 相关的前置条件至少一项仍 Survival，且 sanitizer/authz 等**无效或可绕过**（阶段 A 闭合） | Pruning → **SAFE** |
+
+**跨媒介（DB/Redis/文件/配置）**：当前 hop 为 Reader 时，除 `insert_node` 落 Writer 外，在 Writer hop 须搜索「谁写入该键/表/字段」；若全项目仅 `config`/`builtin`/迁移/安装脚本写入 → 数据面 **不可控** → 上游 Survival 的 data 维失效 → 整条链 **SAFE**。
+
+**禁止写法**：`detail` 中不得把未证实的可控性列为「利用条件」「攻击者需控制 $x」（等于承认未证实仍报漏洞）。要么读码证实可控，要么 **SAFE**。
+</exploitability_gate>
 
 <audit_info>
 **须写 `record_info`（满足任一且上下文无等价条目）**：
@@ -123,8 +143,9 @@ entry_point | param_source | caller | data_flow | sanitizer | validator | authz 
 <guardrails>
 - 阶段 A 须评**本节点内部防护有效性**，不能只做参数可控性判断；有 `if`/sanitizer 须写明对**哪一字段**、**能否绕过**，再决定 Pruning/Survival。
 - 先五维传递性再判 SAFE；`if` 校验须评对象、绕过面、是否覆盖本 Sink 所需维度。
-- 除非 Pruning，须追到 `entry_point`。
-- 禁止臆造未读代码；信息不足则继续 `tool_call`。
+- 除非 Pruning，须追到 `entry_point`；在 `entry_point` 完成 `<exploitability_gate>` 三连证后再结案。
+- 禁止臆造未读代码；信息不足则继续 `tool_call`（含：入口 method 是否存在、DB 字段写入方、配置是否用户可改）。
+- **未证实 Source 可控或入口不可达时禁止 `LIKELY_VULNERABLE`**；这与「轮次耗尽」强制收口一致（见 force_conclude）。
 - **`line` 为空**（未设置/空串/`0`）：工具得到可写行号后，**下一条**须 `neo4j_update_node`（`node_spec` 用上下文 `elementId`），再 `insert_node`/`fork`；已有非空非 0 的 `line` 不强制。
 </guardrails>
 
@@ -137,9 +158,9 @@ entry_point | param_source | caller | data_flow | sanitizer | validator | authz 
 **每轮决策**：未完成阶段 A → 仅读码/读 helper；须写 `record_info` 且未写 → **仅** `record_info`；否则 Survival 可查 caller；**TOOL_RESULT 已含直接上游/Writer 的文件+函数名 → 仅** `neo4j_update_node`（若触发行号补全）或 `insert_node`|`fork`。
 
 **只有两种确定性结论，禁止任何「疑似 / 待定 / 可能」中间态**：
-- `LIKELY_VULNERABLE`：存在从 Source 到 Sink 的可利用路径，或本 Sink 所需防护缺失 / 可绕过；即便利用仍依赖某些环境或配置，只要路径在合理条件下成立即判 `LIKELY_VULNERABLE`。
-- `SAFE`：相关前置条件已被不可绕过地破坏，或防护有效且覆盖本 Sink 所需全部维度。
-**判定原则**：不确定不等于疑似 —— 须继续 `tool_call` 调查直到能给出确定结论；唯有轮次耗尽时按强制收口提示做 Best Effort 二选一。
+- `LIKELY_VULNERABLE`：**仅当** `<exploitability_gate>` 三连证均已用读码证据成立（路径可达 + Source 可控 + 防护缺失/可绕过）。不得因「Sink 危险」或「若某参数可控则可利用」而升格。
+- `SAFE`：Pruning；或入口不可达；或 Source 不可控（含 DB/配置无用户写路径）；或三连证任一项无法证实。
+**判定原则**：不确定 ≠ 疑似漏洞 —— 对**可利用性**继续 `tool_call` 直至能证实或证伪；**无法证实可控/可达即判 `SAFE`**（与二次校验「无法确证即 REJECTED」对齐，避免误报进确认流程）。轮次耗尽时按 force_conclude：**缺证据偏向 `SAFE`**。
 
 **final_resolution 强制场景**：(1) entry_point 且入口验证完成；(2) 任意 hop 确认前置条件已死。禁止以信息不足结案；代码不全、caller 未定位、跨媒介写入未定位、防护有效性未证实 → 继续调查。
 - `vul_name`：`LIKELY_VULNERABLE` 时必填简短名称；`SAFE` 为 `""`。
@@ -220,6 +241,14 @@ entry_point | param_source | caller | data_flow | sanitizer | validator | authz 
   <situation>强类型绑定+参数化查询，用户输入无法进入语句结构</situation>
   <output>{{"thought":"阶段A：前置条件已死。","action":"final_resolution","resolution":{{"verdict":"SAFE","confidence":"HIGH","vul_name":"","detail":"...","entry_points":[],"findings":[],"security_boundaries":[]}}}}</output>
 </example>
+<example name="entry_method_missing">
+  <situation>入口 cron.php 调度 methodName='ajaxSchedule'，但 control 类仅有 ajaxExec，call_user_func 将失败</situation>
+  <output>{{"thought":"entry_point：入口 method 不存在，路径不可达。","action":"final_resolution","resolution":{{"verdict":"SAFE","confidence":"HIGH","vul_name":"","detail":"cron 分发目标方法在 control 中不存在，链路在入口即中断。","entry_points":[],"findings":[],"security_boundaries":[]}}}}</output>
+</example>
+<example name="db_field_not_user_writable">
+  <situation>Sink 使用 $pivot->sql；表字段仅由 config->bi->builtin 内置 pivot 写入，无用户 API 写 TABLE_PIVOTSPEC</situation>
+  <output>{{"thought":"Writer hop：无用户可控写入，data 维不成立。","action":"final_resolution","resolution":{{"verdict":"SAFE","confidence":"HIGH","vul_name":"","detail":"sql/driver 来自 DB 对象但写入仅来自内置配置，攻击者无法控制，命令注入前提不成立。","entry_points":[],"findings":[],"security_boundaries":[]}}}}</output>
+</example>
 <example name="fork_multi_caller">
   <situation>两个不同文件中的函数分别调用当前 hop</situation>
   <output>{{"thought":"阶段B已完成；","action":"fork","branches":[{{"type":"caller","file":"a.js","line":10,"function":"handlerA","reason":"..."}},{{"type":"caller","file":"b.js","line":20,"function":"handlerB","reason":"..."}}]}}</output>
@@ -247,6 +276,9 @@ chain_node_prompt = '''
 行号缺失/空/0：工具确认后须先 `neo4j_update_node` 再追溯（见系统 `<guardrails>`）。
 **本 hop 必须先做阶段 A**：评完防护并按需 `record_info` 后再查 caller。**工具结果一旦给出直接上游（文件+函数名），下一输出必须是 `insert_node` 或 `fork`**，不得继续 `tool_call` 读调用方或追更上层。
 
+**节点类型为 `entry_point` 时**：按系统 prompt 完成入口三连证与 `<exploitability_gate>`；method 不存在、Source 不可控（含 DB 仅内置/config 写入）→ 直接 `final_resolution` + `SAFE`，勿输出 `LIKELY_VULNERABLE` 交二次校验。
+**节点类型为 `param_source` / 跨媒介 Reader 上游**：须证实攻击者可影响该参数或存在用户可达 Writer；否则在当 hop Pruning 或 entry 结案为 **SAFE**。
+
 ### AuditInfo（已知信息勿重复 record_info；）
 可能来自链路节点或本 risk 全局知识库；读全局条目时注意适用范围。
 {sink_chain_audit_info}
@@ -259,11 +291,11 @@ chain_analyzer_force_conclude_prompt = '''## 强制收口（轮次耗尽）
 **要求**
 1. 禁止「需要更多信息」类表述
 2. `verdict` 必为二选一：`LIKELY_VULNERABLE` | `SAFE`（无疑似/待定中间态）
-3. 有 Source→Sink 片段、明显防御缺失或可绕过 → `LIKELY_VULNERABLE`
-4. 强防护且未见绕过 → `SAFE`（confidence LOW/MEDIUM）
-5. 链路未闭环、上游未确认、分支/配置未决，但存在合理可利用路径 → 仍判 `LIKELY_VULNERABLE`（confidence LOW）；若证据更偏向防护成立则 `SAFE`（confidence LOW）
+3. **仅当**三连证（路径可达、Source 可控、防护缺失/可绕过）均有已读代码依据 → `LIKELY_VULNERABLE`（confidence 按证据强度）
+4. 强防护、入口不可达、DB/配置无用户写路径、或**任一核心假设未证实** → `SAFE`（confidence LOW/MEDIUM），`detail` 写明证伪点
+5. **禁止**因「Sink 本身危险」或「若攻击者能控制某字段则可 RCE」而判 `LIKELY_VULNERABLE`；未证实可控/可达一律 `SAFE`
 
-`resolution` 须含：已确认路径片段、关键缺口、成立所需假设；字段与常规结案一致。
+`resolution` 须含：已证实或已证伪的路径片段；**勿**把未证实项写成「利用条件」；字段与常规结案一致。
 
 ```json
 {{
