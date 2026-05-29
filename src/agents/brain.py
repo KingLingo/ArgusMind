@@ -82,8 +82,17 @@ class Brain:
             if not ok_git:
                 self._log("WARNING", f"[GitNexus] Git 仓库检查: {git_msg}")
             # 创建【GitNexus初始化】事件
+            self._log("INFO", f"[GitNexus] 开始 analyze | root={proj_root}")
+            logger.info("[GitNexus] 开始 analyze | task_id=%s root=%s", self.task_id, proj_root)
             ok_az, az_msg = run_gitnexus_analyze(proj_root)
-            if not ok_az:
+            if ok_az:
+                self._log("INFO", f"[GitNexus] analyze 成功: {_short(az_msg, 500)}")
+                logger.info(
+                    "[GitNexus] analyze 成功 | task_id=%s %s",
+                    self.task_id,
+                    _short(az_msg, 500),
+                )
+            else:
                 self._log(
                     "WARNING",
                     f"[GitNexus] analyze 未成功（仍将尝试连接 MCP，若索引已存在可忽略）: {az_msg}",
