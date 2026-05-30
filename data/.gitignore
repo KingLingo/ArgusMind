@@ -2,5 +2,6 @@
 postgres/
 neo4j/
 work/
+ArgusMind/
 repos/*
 !repos/.gitkeep

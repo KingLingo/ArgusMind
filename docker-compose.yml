@@ -86,7 +86,8 @@ services:
     volumes:
       # 将被测代码库挂载到此目录，在 API 中注册项目时使用容器内路径，例如 /data/repos/my-project
       - ${DATA_DIR:-./data}/repos:/data/repos
-      - ${DATA_DIR:-./data}/work:/app/work
+      # 项目副本与任务临时文件（容器内默认 /tmp/ArgusMind）
+      - ${DATA_DIR:-./data}/tmp/tmp/ArgusMind:/tmp/ArgusMind
     healthcheck:
       test:
         [
