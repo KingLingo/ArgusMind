@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -35,7 +36,7 @@ class PostgresConfig:
     @property
     def sqlalchemy_url(self) -> str:
         return (
-            f"postgresql+psycopg2://{self.user}:{self.password}@"
+            f"postgresql+psycopg2://{self.user}:{quote_plus(self.password)}@"
             f"{self.host}:{self.port}/{self.db}"
         )
 
