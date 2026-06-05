@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from uuid import UUID
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
@@ -26,12 +26,36 @@ from src.schemas.task import (
     TaskUpdate,
 )
 from src.services import stats_service, task_service
+from src.services.token_service import sum_task_tokens_from_ledger
 from src.services.plan_service import fetch_task_language_risk_status
 from src.services.audit_service import AuditConfigMissing, run_task
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[CurrentUserDep])
+
+
+def _inject_token_usage(task: Any) -> TaskRead:
+    """将 token_ledger 聚合结果注入 TaskRead 响应。"""
+    data = TaskRead.model_validate(task)
+    try:
+        from src.infrastructure.db import session_scope
+        from src.services.token_service import (
+            sum_task_cache_stats_from_ledger,
+            sum_task_tokens_from_ledger,
+        )
+        with session_scope() as session:
+            li, lo, ci, co = sum_task_tokens_from_ledger(session, task.id)
+            ch, cm = sum_task_cache_stats_from_ledger(session, task.id)
+        data.llm_input_token = li
+        data.llm_output_token = lo
+        data.code_agent_input_token = ci
+        data.code_agent_output_token = co
+        data.cache_hits = ch
+        data.cache_misses = cm
+    except Exception:
+        pass
+    return data
 
 
 @router.get(
@@ -71,7 +95,8 @@ def get_task_detail(id: UUID = Query(..., alias="id")) -> OkResponse[TaskRead]:
     task = task_service.get_task(str(id))
     if task is None:
         raise NotFoundError("任务不存在")
-    return OkResponse[TaskRead](data=TaskRead.model_validate(task))
+    data = _inject_token_usage(task)
+    return OkResponse[TaskRead](data=data)
 
 
 @router.post("/batch/pause", response_model=OkResponse[TaskBatchResult])
@@ -159,27 +184,17 @@ def get_task(task_id: UUID) -> OkResponse[TaskRead]:
     task = task_service.get_task(str(task_id))
     if task is None:
         raise NotFoundError("任务不存在")
-    return OkResponse[TaskRead](data=TaskRead.model_validate(task))
+    data = _inject_token_usage(task)
+    return OkResponse[TaskRead](data=data)
 
 
 @router.post("", response_model=OkResponse[TaskRead])
-def create_task(body: AuditTaskCreate, background: BackgroundTasks) -> OkResponse[TaskRead]:
+def create_task(body: AuditTaskCreate) -> OkResponse[TaskRead]:
     try:
         task = task_service.create_task(body)
     except task_service.ProjectNotFound:
         raise NotFoundError("关联项目不存在")
 
-    def _runner():
-        try:
-            run_task(task.id, project_id=body.project_id)
-        except AuditConfigMissing as ex:
-            logger.warning("[run_task] 配置缺失: %s", ex)
-        except Exception as ex:  # pragma: no cover
-            logger.exception("[run_task] 执行异常: %s", ex)
-
-    background.add_task(_runner)
-    # 任务成功加入后台执行队列后，立即置为 running。
-    task = task_service.update_task(task.id, TaskUpdate(status="running")) or task
     return OkResponse[TaskRead](data=TaskRead.model_validate(task))
 
 
@@ -223,6 +238,29 @@ def resume_task(task_id: UUID, background: BackgroundTasks) -> OkResponse[TaskRe
     task_id_str = str(task_id)
     try:
         task = task_service.resume_task(task_id_str)
+    except task_service.TaskNotFound:
+        raise NotFoundError("任务不存在")
+    except task_service.InvalidTaskState as ex:
+        raise BadRequestError(str(ex))
+
+    def _runner():
+        try:
+            run_task(task_id_str, project_id=task.project_id)
+        except AuditConfigMissing as ex:
+            logger.warning("[run_task] 配置缺失: %s", ex)
+        except Exception as ex:  # pragma: no cover
+            logger.exception("[run_task] 执行异常: %s", ex)
+
+    background.add_task(_runner)
+    return OkResponse[TaskRead](data=TaskRead.model_validate(task))
+
+
+@router.get("/{task_id}/retry", response_model=OkResponse[TaskRead])
+def retry_task(task_id: UUID, background: BackgroundTasks) -> OkResponse[TaskRead]:
+    """重试失败的任务：将状态置为 pending 并重新执行。"""
+    task_id_str = str(task_id)
+    try:
+        task = task_service.retry_task(task_id_str)
     except task_service.TaskNotFound:
         raise NotFoundError("任务不存在")
     except task_service.InvalidTaskState as ex:

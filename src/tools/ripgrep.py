@@ -68,8 +68,8 @@ class RipgrepFilesTool(BaseTool):
         {
             "name": "root",
             "type": "string",
-            "description": "起始目录；相对路径时相对于项目根",
-            "required": True,
+            "description": "起始目录；相对路径时相对于项目根，不传则默认项目根",
+            "required": False,
         },
         {
             "name": "glob",
@@ -113,13 +113,15 @@ class RipgrepFilesTool(BaseTool):
 
     def run(
         self,
-        root: Union[str, Path],
+        root: Optional[Union[str, Path]] = None,
         glob: Optional[Union[str, List[str]]] = None,
         hidden: bool = True,
         follow: bool = False,
         max_depth: Optional[int] = None,
         **kwargs: Any,
     ) -> ToolResult:
+        if root is None:
+            root = self._base_path or "."
         path, resolve_err = _resolve_under_project(root, self._base_path)
         if resolve_err:
             return ToolResult(
@@ -202,8 +204,8 @@ class RipgrepSearchTool(BaseTool):
         {
             "name": "root",
             "type": "string",
-            "description": "搜索根目录；相对路径时相对于项目根",
-            "required": True,
+            "description": "搜索根目录；相对路径时相对于项目根，不传则默认项目根",
+            "required": False,
         },
         {
             "name": "pattern",
@@ -271,13 +273,15 @@ class RipgrepSearchTool(BaseTool):
 
     def run(
         self,
-        root: Union[str, Path],
-        pattern: str,
+        root: Optional[Union[str, Path]] = None,
+        pattern: str = "",
         glob: Optional[Union[str, List[str]]] = None,
         limit: Optional[int] = None,
         follow: bool = False,
         **kwargs: Any,
     ) -> ToolResult:
+        if root is None:
+            root = self._base_path or "."
         path, resolve_err = _resolve_under_project(root, self._base_path)
         if resolve_err:
             return ToolResult(

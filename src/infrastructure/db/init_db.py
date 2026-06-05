@@ -16,7 +16,6 @@ from src.infrastructure.db import Base, init_engine, session_scope
 from src.infrastructure.db.models import ConfigEntry, User  # noqa: F401  保证模型被注册
 from src.infrastructure.db import models  # noqa: F401  批量注册所有模型
 from src.infrastructure.security.password import hash_password
-from src.tools.opencode import OpenCodeTool
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +106,7 @@ def fetch_litellm_provider_list() -> Dict[str, Any]:
 
 def fetch_opencode_provider_list() -> Dict[str, Any]:
     """拉取 OpenCode 的 provider/model 清单（通过本地 opencode 服务）。"""
+    from src.tools.opencode import OpenCodeTool
     tool: OpenCodeTool | None = None
     service_url = ""
     try:
@@ -218,7 +218,67 @@ def create_all_tables(config: Config) -> bool:
     engine = init_engine(config.postgres)
     Base.metadata.create_all(engine)
     logger.info("[init_db] ORM 建表完成: db=%s created=%s", config.postgres.db, created)
+
+    # 对已有表的列补建（create_all 不会修改已有表结构）
+    _ensure_missing_columns(engine, config.postgres.db)
+    # 对已有表的外键约束进行迁移（create_all 不会修改已有约束）
+    _ensure_fk_constraints(engine)
+
     return created
+
+
+def _ensure_missing_columns(engine, db_name: str) -> None:
+    """对已有表补建缺失的列（幂等：已存在则跳过）。"""
+    import sqlalchemy as sa
+
+    migrations = [
+        # (table, column, type_def)
+        ("tasks", "offline_mode", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("tasks", "vuln_count", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    with engine.connect() as conn:
+        for table, column, type_def in migrations:
+            result = conn.execute(
+                sa.text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = :tn AND column_name = :cn"
+                ),
+                {"tn": table, "cn": column},
+            )
+            if result.fetchone() is None:
+                conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {type_def}"))
+                conn.commit()
+                logger.info("[init_db] 列迁移: %s.%s 已添加", table, column)
+
+
+def _ensure_fk_constraints(engine) -> None:
+    """将已有外键约束从 SET NULL 迁移为 CASCADE（幂等）。"""
+    import sqlalchemy as sa
+
+    migrates = [
+        # (constraint_name, table, column, ref_table, ref_column)
+        ("vulnerability_task_id_fkey", "vulnerability", "task_id", "tasks", "id"),
+    ]
+    with engine.connect() as conn:
+        for cname, table, column, ref_table, ref_column in migrates:
+            row = conn.execute(
+                sa.text(
+                    "SELECT delete_rule FROM information_schema.referential_constraints "
+                    "WHERE constraint_name = :cn AND constraint_schema = 'public'"
+                ),
+                {"cn": cname},
+            ).fetchone()
+            if row and row[0] == "SET NULL":
+                conn.execute(sa.text(f"ALTER TABLE {table} DROP CONSTRAINT {cname}"))
+                conn.execute(
+                    sa.text(
+                        f"ALTER TABLE {table} ADD CONSTRAINT {cname} "
+                        f"FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}) ON DELETE CASCADE"
+                    )
+                )
+                conn.commit()
+                logger.info("[init_db] FK 迁移: %s ON DELETE SET NULL -> CASCADE", cname)
+
 
 def ensure_database_exists(config: Config) -> bool:
     """若目标数据库不存在则自动创建，返回是否新建了数据库。"""

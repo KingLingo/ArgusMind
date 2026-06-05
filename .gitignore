@@ -19,8 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual Environment
+*.html
+.reasonix/
+## Virtual Environment
 venv/
 ENV/
 env/

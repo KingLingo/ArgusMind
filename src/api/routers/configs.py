@@ -18,7 +18,6 @@ from src.schemas.config import (
     LLMConfigUpdate,
 )
 from src.services import config_service
-from src.tools.opencode import OpenCodeTool
 
 router = APIRouter(dependencies=[CurrentUserDep])
 
@@ -97,6 +96,27 @@ def test_llm_config() -> OkResponse[str]:
         )
 
 
+@router.get("/llm/provider-models", response_model=OkResponse[list[str]])
+def get_llm_provider_models() -> OkResponse[list[str]]:
+    """从已保存的 LLM_config 中读取 provider/baseurl/key，调用 /v1/models 获取实时模型列表。"""
+    cfg = config_service.get_value_json(config_service.CFG_LLM)
+    if not cfg:
+        return OkResponse[list[str]](success=False, data=[])
+    provider = (cfg.get("LLM_provider") or "").strip()
+    baseurl = (cfg.get("LLM_baseurl") or "").strip()
+    key = (cfg.get("LLM_key") or "").strip()
+    if not provider or not key:
+        return OkResponse[list[str]](success=False, data=[])
+    try:
+        models = config_service.fetch_provider_models(provider, baseurl, key)
+        return OkResponse[list[str]](data=models)
+    except Exception:
+        return OkResponse[list[str]](
+            success=False,
+            data=[],
+        )
+
+
 @router.get("/llm/provider-list", response_model=OkResponse[Any])
 def get_llm_provider_list_config() -> OkResponse[Any]:
     config = config_service.get_value_json(config_service.CFG_LLM_PROVIDER_LIST) or {}
@@ -121,6 +141,7 @@ def test_code_agent_config() -> OkResponse[str]:
     if runtime_cfg is None:
         raise NotFoundError("code-agent 配置不完整，无法测试")
 
+    from src.tools.opencode import OpenCodeTool
     project_root = str(Path(__file__).resolve().parents[2])
     tool = OpenCodeTool(
         project_path=project_root,

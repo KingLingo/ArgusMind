@@ -101,7 +101,16 @@ class ReadFileTool(BaseTool):
             "示例：run(file_path='D:/proj/src/main.py') 或 run(file_path='src/main.py')（相对项目根）"
         )
 
-    def run(self, file_path: Union[str, Path], **kwargs) -> ToolResult:
+    def run(self, file_path: Union[str, Path, None] = None, **kwargs) -> ToolResult:
+        # 兼容 LLM 传 path/filepath 而非 file_path 的情况
+        if file_path is None:
+            file_path = kwargs.pop("path", None) or kwargs.pop("filepath", None)
+        if file_path is None:
+            return ToolResult(
+                success=False,
+                error="缺少 file_path 参数",
+                error_code=ERROR_CODE_INVALID_ARGUMENT,
+            )
         path, resolve_err = _resolve_under_project(file_path, self._base_path)
         if resolve_err:
             return ToolResult(
@@ -226,11 +235,20 @@ class ReadLinesTool(BaseTool):
 
     def run(
         self,
-        file_path: Union[str, Path],
-        start_line: int,
-        end_line: int,
+        file_path: Union[str, Path, None] = None,
+        start_line: int = 1,
+        end_line: int = 1,
         **kwargs,
     ) -> ToolResult:
+        # 兼容 LLM 传 path/filepath 而非 file_path 的情况
+        if file_path is None:
+            file_path = kwargs.pop("path", None) or kwargs.pop("filepath", None)
+        if file_path is None:
+            return ToolResult(
+                success=False,
+                error="缺少 file_path 参数",
+                error_code=ERROR_CODE_INVALID_ARGUMENT,
+            )
         path, resolve_err = _resolve_under_project(file_path, self._base_path)
         if resolve_err:
             return ToolResult(
@@ -321,8 +339,8 @@ class ListFilesTool(BaseTool):
         {
             "name": "root",
             "type": "string",
-            "description": "目录路径：绝对路径",
-            "required": True,
+            "description": "目录路径：绝对路径，不传则默认项目根",
+            "required": False,
         },
         {"name": "pattern", "type": "string", "description": "glob 模式，如 '**/*.py'，默认 '**/*'", "required": False},
     ]
@@ -347,10 +365,12 @@ class ListFilesTool(BaseTool):
 
     def run(
         self,
-        root: Union[str, Path],
+        root: Optional[Union[str, Path]] = None,
         pattern: str = "**/*",
         **kwargs,
     ) -> ToolResult:
+        if root is None:
+            root = self._base_path or "."
         path, resolve_err = _resolve_under_project(root, self._base_path)
         if resolve_err:
             return ToolResult(

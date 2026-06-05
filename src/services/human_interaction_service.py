@@ -10,7 +10,7 @@ from src.infrastructure.db import session_scope
 from src.infrastructure.db.models import HumanInteraction
 
 DEFAULT_TIMEOUT_SECONDS = 60
-POLL_INTERVAL_SECONDS = 10
+POLL_INTERVAL_SECONDS = 2
 
 
 def _normalize_timeout(timeout_seconds: Optional[int]) -> int:

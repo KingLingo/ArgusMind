@@ -16,4 +16,5 @@ class ExecutionContext:
     project_path: Path
     llm_config: LLMConfig
     opencode_config: Optional[OpenCodeConfig] = None
+    offline_mode: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)

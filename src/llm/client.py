@@ -179,6 +179,8 @@ class LLMClient:
             max_tokens=max_tokens,
             **kwargs,
         )
+        # 强制超时：litellm 默认无超时，API 挂起时永久阻塞
+        litellm_kw.setdefault("timeout", 120)
         last_exc: Optional[BaseException] = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
@@ -206,6 +208,33 @@ class LLMClient:
                 ) from e
 
             content = response.choices[0].message.content or ""
+
+            # ------------------------------------------------------------
+            # 空/异常的 LLM 响应检测
+            #
+            # 部分 API 网关/代理在上游限流或服务异常时，可能将实际错误
+            # （429 Too Many Requests / 503 Service Unavailable）包装为
+            # HTTP 200 OK 但返回空 content 或极短无效内容。
+            #
+            # 此类响应对调用方表现为"成功但非 JSON 对象"消息，排查困难。
+            # 统一按可重试瞬时错误处理，让外层 retry 循环自动退避重试。
+            # ------------------------------------------------------------
+            content_stripped = content.strip()
+            if not content_stripped:
+                last_exc = LLMError(
+                    "LLM 返回空 content（可能 API 网关吞掉了错误状态码）",
+                    retryable=True,
+                )
+                if attempt < self.MAX_RETRIES:
+                    sleep_s = min(2 ** (attempt - 1), 8)
+                    logger.warning(
+                        "LLM 返回空 content，第 %d/%d 次尝试，%ss 后重试",
+                        attempt, self.MAX_RETRIES, sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                raise last_exc
+
             prompt_tokens, completion_tokens, total_tokens = self._parse_usage(response)
             return LLMResponse(
                 content=content,

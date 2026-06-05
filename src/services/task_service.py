@@ -42,6 +42,7 @@ def create_task(data: AuditTaskCreate) -> Task:
         task = Task(
             project_id=data.project_id,
             name=data.name,
+            offline_mode=data.offline_mode,
             status="pending",
         )
         TaskRepository(session).add(task)
@@ -219,6 +220,28 @@ def resume_task(task_id: str) -> Task:
         ctrl.clear_paused(task_id)
         ctrl.clear_stopped(task_id)
         task.status = TaskStatus.RUNNING.value
+        if task.finished_at is not None:
+            task.finished_at = None
+        repo.update(task)
+        session.expunge(task)
+        return task
+
+
+def retry_task(task_id: str) -> Task:
+    """重试失败的任务：FAILED -> PENDING，清除内存标志与完成时间。"""
+    with session_scope() as session:
+        repo = TaskRepository(session)
+        task = repo.get(task_id)
+        if task is None:
+            raise TaskNotFound(task_id)
+        current = TaskStatus(task.status)
+        if current != TaskStatus.FAILED:
+            raise InvalidTaskState(f"仅 failed 状态可重试，当前为 {task.status}")
+        ensure_transition(current, TaskStatus.PENDING)
+        ctrl = get_task_control()
+        ctrl.clear_paused(task_id)
+        ctrl.clear_stopped(task_id)
+        task.status = TaskStatus.PENDING.value
         if task.finished_at is not None:
             task.finished_at = None
         repo.update(task)

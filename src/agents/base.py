@@ -9,6 +9,7 @@ BaseAgent —— 所有 Agent 的公共基类。
 import json
 import logging
 import traceback
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from src.core.event_span import EventSpan
@@ -26,9 +27,14 @@ logger = logging.getLogger(__name__)
 class BaseAgent:
     """所有需要 LLM 多轮对话 + 工具调用的 Agent 的公共基类。"""
 
+    _TOOL_CACHE_MAXSIZE = 128
+
     def __init__(self, brain: Optional[Brain] = None, max_retries: int = 3):
         self._brain = brain
         self.max_retries = max_retries
+        self._tool_cache: OrderedDict[str, Any] = OrderedDict()
+        self._tool_cache_hits = 0
+        self._tool_cache_misses = 0
 
     @property
     def _agent_tag(self) -> str:
@@ -69,6 +75,24 @@ class BaseAgent:
             ensure_task_running(task_id or "")
             try:
                 result, input_token, output_token = self._brain.ask(conversation)
+                # 如果 LLM 未返回 token 用量，用字符数估计作为兜底
+                if input_token == 0 and output_token == 0 and isinstance(result, dict):
+                    input_token = sum(len(m.get("content", "")) for m in conversation) // 4
+                    output_token = max(len(json.dumps(result, ensure_ascii=False)) // 4, 1)
+                # 直接上报 token（绕开 EventSpan/TicketEvent 链路，保证落库）
+                if task_id and (input_token or output_token):
+                    try:
+                        from src.services.token_service import report_token_usage
+                        report_token_usage(
+                            task_id=task_id,
+                            llm_input=input_token,
+                            llm_output=output_token,
+                            code_agent_input=0,
+                            code_agent_output=0,
+                            note=self._agent_tag,
+                        )
+                    except Exception:
+                        pass
             except LLMError:
                 # LLM 服务级致命错误（额度不足/鉴权失败/网络异常等）：
                 # 绝不能吞成"空响应"后继续重试并标记完成，必须向上抛出，
@@ -150,6 +174,35 @@ class BaseAgent:
             return 0
         return count
 
+    def _report_cache_stats(self, task_id: str) -> None:
+        """将当前 Agent 的 tool cache 命中率写入 token_ledger（note='cache_stats'，覆盖写入）。"""
+        if not task_id:
+            return
+        try:
+            from src.services.token_service import report_token_usage
+            report_token_usage(
+                task_id=task_id,
+                llm_input=self._tool_cache_hits,
+                llm_output=self._tool_cache_misses,
+                code_agent_input=0,
+                code_agent_output=0,
+                note=f"cache_stats:{self._agent_tag}",
+            )
+        except Exception:
+            logger.debug("[%s] cache stats 上报失败", self._agent_tag)
+
+    @property
+    def tool_cache_stats(self) -> Dict[str, Any]:
+        """返回当前 Agent 的 tool cache 统计。"""
+        total = self._tool_cache_hits + self._tool_cache_misses
+        rate = (self._tool_cache_hits / total * 100) if total > 0 else 0.0
+        return {
+            "hits": self._tool_cache_hits,
+            "misses": self._tool_cache_misses,
+            "total": total,
+            "hit_rate": round(rate, 1),
+        }
+
     def _execute_tool_call(
             self,
             step: Dict[str, Any],
@@ -177,6 +230,21 @@ class BaseAgent:
             return None
         if tool_name == "code_agent":
             return self._run_code_agent(tool_name, arguments, event_span)
+
+        # 只缓存只读工具（read_file / read_lines / ripgrep / search / list）
+        _cacheable_prefixes = ("read_", "readlines", "ripgrep", "search", "list_")
+        _cache_key = None
+        if tool_name.startswith(_cacheable_prefixes) and isinstance(arguments, dict):
+            _cache_key = f"{tool_name}:{hash(frozenset((k, str(v)) for k, v in sorted(arguments.items())))}"
+            if _cache_key in self._tool_cache:
+                self._tool_cache_hits += 1
+                cached = self._tool_cache[_cache_key]
+                # move to end (LRU)
+                self._tool_cache.move_to_end(_cache_key)
+                logger.debug("[%s] 工具缓存命中 %s", self._agent_tag, tool_name)
+                return cached
+            self._tool_cache_misses += 1
+
         try:
             result = self._brain.run_tool(tool_name, **arguments)
             if isinstance(result, dict):
@@ -187,12 +255,23 @@ class BaseAgent:
                         f"error={result.get('error')!r}",
                     )
                 if self._brain is not None:
-                    return limit_tool_result(
+                    final_result = limit_tool_result(
                         result,
                         self._brain.tmp_dir,
                         tool_name=tool_name,
                     )
-            return result
+                else:
+                    final_result = result
+            else:
+                final_result = result
+
+            # 写入缓存（仅成功的结果）
+            if _cache_key is not None and isinstance(final_result, dict) and final_result.get("success", True):
+                self._tool_cache[_cache_key] = final_result
+                if len(self._tool_cache) > self._TOOL_CACHE_MAXSIZE:
+                    self._tool_cache.popitem(last=False)
+
+            return final_result
         except Exception as e:
             self._publish_log(
                 "WARNING",

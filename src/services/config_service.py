@@ -16,7 +16,6 @@ from src.infrastructure.db import session_scope
 from src.infrastructure.db.models import ConfigEntry
 from src.schemas.config import CodeAgentConfigUpdate
 from src.tmp_dir import tmp_base_glob
-from src.tools.opencode import OpenCodeTool
 
 CFG_LLM = "LLM_config"
 CFG_CODE_AGENT = "code_agent_config"
@@ -126,6 +125,40 @@ def get_opencode_runtime_config() -> Optional[OpenCodeConfig]:
         model_id=cfg.get("code_agent_model") or None,
         provider_id=cfg.get("code_agent_provider") or None,
     )
+
+
+def fetch_provider_models(provider: str, baseurl: str, key: str) -> list[str]:
+    """调用 OpenAI-compatible API 的 /v1/models 端点获取实时模型列表。
+
+    返回模型 ID 列表；失败时抛出异常。
+    """
+    import httpx
+
+    # 确定请求 URL
+    url = baseurl.rstrip("/")
+    if not url:
+        # 根据 provider 猜测默认端点
+        defaults = {
+            "deepseek": "https://api.deepseek.com",
+            "openai": "https://api.openai.com",
+            "anthropic": "https://api.anthropic.com",
+        }
+        url = defaults.get(provider.lower(), f"https://api.{provider}.com")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    url += "/models"
+
+    headers = {"Authorization": f"Bearer {key}"}
+    resp = httpx.get(url, headers=headers, timeout=15.0)
+    resp.raise_for_status()
+    data = resp.json()
+
+    models: list[str] = []
+    for item in data.get("data", []):
+        mid = (item.get("id") or "").strip()
+        if mid:
+            models.append(mid)
+    return sorted(models)
 
 
 def ensure_jwt_secret() -> str:
@@ -253,6 +286,7 @@ async def _save_code_agent_config_to_opencode(cfg: Dict[str, Any]) -> None:
             "external_directory": {tmp_glob: "allow"}
         }
     }
+    from src.tools.opencode import OpenCodeTool
     tool = OpenCodeTool(project_path=_project_root())
     try:
         service_url = tool.get_url().rstrip("/")

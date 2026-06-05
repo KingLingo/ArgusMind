@@ -24,6 +24,10 @@ from services.plan_service import mark_risk_category_sink_finder_completed
 from services.sink_flow_service import persist_sink_flow_to_neo4j
 from src.utils.ids import generate_uuid
 from src.utils.json_parse import parse_json
+from src.knowledge import LANGUAGE_AUDIT_RULES_LLM, build_audit_system_prompt
+from src.knowledge.framework_rules import detect_framework, get_dangerous_patterns, get_framework_vulns
+from src.knowledge.security_domains import get_grep_rules, QUICK_GREP_RULES
+from src.knowledge.detection_patterns import format_detection_patterns_for_prompt, get_language_checklist
 
 _SINK_RES_SCHEMA_HINT = (
     "顶层须为 JSON 数组；每项为对象，必填字段："
@@ -604,71 +608,241 @@ class SinkFinder(BaseAgent):
         super().__init__(brain)
         self.max_retries = 10
 
+    def _build_quick_scan_hint(self, vul_name: str, language: str) -> str:
+        """从快速扫描结果中提取与当前漏洞类型相关的线索，按需注入。"""
+        if not self._brain or not hasattr(self._brain, "quick_scan_findings"):
+            return ""
+        qs_findings = self._brain.quick_scan_findings
+        if not qs_findings:
+            return ""
+
+        # 漏洞类型关键词映射（中英文）
+        vuln_keywords = {
+            "命令注入": ["COMMAND_INJECTION", "命令注入", "命令执行"],
+            "SQL注入": ["SQL_INJECTION", "SQL注入", "sql_injection"],
+            "代码执行": ["CODE_INJECTION", "代码执行", "代码注入", "RCE"],
+            "路径遍历": ["PATH_TRAVERSAL", "路径遍历", "目录遍历"],
+            "XSS": ["XSS", "跨站脚本"],
+            "SSRF": ["SSRF", "服务端请求伪造"],
+            "XXE": ["XXE", "XML外部实体"],
+            "反序列化": ["DESERIALIZATION", "反序列化"],
+            "认证绕过": ["AUTH_BYPASS", "认证绕过"],
+            "IDOR": ["IDOR", "越权"],
+            "CSRF": ["CSRF"],
+            "文件上传": ["FILE_UPLOAD", "文件上传"],
+            "组件漏洞": ["COMPONENT_VULNERABILITY", "组件"],
+        }
+
+        # 找到匹配的关键词
+        matched_keywords = set()
+        for key, keywords in vuln_keywords.items():
+            if key in vul_name:
+                matched_keywords.update(keywords)
+        # 也加入 vul_name 本身
+        matched_keywords.add(vul_name)
+
+        if not matched_keywords:
+            return ""
+
+        # 筛选匹配的快速扫描结果
+        relevant = []
+        for f in qs_findings:
+            f_vuln = f.get("vuln_type", "")
+            f_title = f.get("title", "")
+            for kw in matched_keywords:
+                if kw in f_vuln or kw in f_title:
+                    relevant.append(f)
+                    break
+
+        if not relevant:
+            return ""
+
+        # 构建提示（限制数量避免上下文膨胀）
+        hint = "\n\n## 快速扫描线索（规则引擎预扫描结果，仅供参考）\n"
+        hint += "以下位置已被规则引擎标记为潜在风险点，请重点关注：\n"
+        for f in relevant[:8]:
+            location = f.get("location", f.get("file", ""))
+            severity = f.get("severity", "")
+            evidence = f.get("evidence", "")
+            hint += f"- **{location}** [{severity}] {evidence}\n"
+        hint += "\n注意：以上线索来自正则规则匹配，可能存在误报，请结合代码上下文验证。\n"
+        return hint
+
+    def _build_gapfill_hint(self, vul_name: str) -> str:
+        """从防漏报兜底任务中提取与当前漏洞类型相关的盲区提示，按需注入。"""
+        if not self._brain or not hasattr(self._brain, "gapfill_tasks"):
+            return ""
+        gapfill_tasks = self._brain.gapfill_tasks
+        if not gapfill_tasks:
+            return ""
+
+        # 漏洞类型关键词映射
+        vuln_keywords = {
+            "命令注入": ["COMMAND_INJECTION", "命令注入"],
+            "SQL注入": ["SQL_INJECTION", "SQL注入"],
+            "代码执行": ["CODE_INJECTION", "代码执行"],
+            "路径遍历": ["PATH_TRAVERSAL", "路径遍历"],
+            "XSS": ["XSS", "跨站脚本"],
+            "SSRF": ["SSRF"],
+            "XXE": ["XXE"],
+            "反序列化": ["DESERIALIZATION", "反序列化"],
+            "认证绕过": ["AUTH_BYPASS", "认证绕过"],
+            "CSRF": ["CSRF"],
+            "硬编码密钥": ["HARD_CODED_SECRET", "硬编码"],
+            "弱加密": ["WEAK_CRYPTO", "弱加密"],
+        }
+
+        matched_keywords = set()
+        for keywords in vuln_keywords.values():
+            if any(kw in vul_name for kw in keywords):
+                matched_keywords.update(keywords)
+
+        if not matched_keywords:
+            return ""
+
+        relevant = []
+        for task in gapfill_tasks:
+            attack_class = task.get("attackClass", "")
+            if any(kw in attack_class for kw in matched_keywords):
+                relevant.append(task)
+
+        if not relevant:
+            return ""
+
+        hint = "\n\n## 防漏报盲区提示（覆盖率追踪发现的未检查区域）\n"
+        hint += "以下区域在当前审计中尚未被充分覆盖，请额外关注：\n"
+        for task in relevant[:5]:
+            target = task.get("targetFile", task.get("subsystem", ""))
+            attack = task.get("attackClass", "")
+            reason = task.get("reason", "")
+            hint += f"- **{target}** 缺少 {attack} 检查 ({reason})\n"
+        hint += "\n注意：以上是覆盖率分析发现的盲区，请确保这些区域得到审查。\n"
+        return hint
+
+    def _build_rag_hint(self, vul_name: str) -> str:
+        """从 RAG 服务按需检索与当前漏洞类型相关的知识文档。"""
+        try:
+            from src.services.rag_service import get_rag_service
+            rag = get_rag_service()
+            results = rag.query(vul_name, top_k=3)
+            if not results:
+                return ""
+            hint = "\n\n## 相关安全知识（RAG 检索）\n"
+            for doc in results[:3]:
+                title = doc.get("title", "")
+                content = doc.get("content", "")
+                if content and len(content) > 300:
+                    content = content[:300] + "..."
+                hint += f"- **{title}**: {content}\n"
+            return hint
+        except Exception:
+            return ""
+
     def run(self, language, vul_name, vul_node_id, reasoning_basis, risk_description):
+        # 注入知识库语言审计规则
+        lang_ext = f".{language.lower()}" if not language.startswith(".") else language.lower()
+        lang_rules = LANGUAGE_AUDIT_RULES_LLM.get(lang_ext, "")
+        system_content = sink_finder_prompt
+        if lang_rules:
+            system_content += "\n\n" + lang_rules
+
+        # 注入框架特定漏洞规则（仅注入与当前漏洞类型相关的危险模式）
+        lang_key = language.lower().lstrip(".")
+        dangerous = get_dangerous_patterns(lang_key)
+        if dangerous:
+            vuln_to_danger = {
+                "命令注入": "command_exec", "命令执行": "command_exec",
+                "SQL注入": "sql_injection_risk", "sql_injection": "sql_injection_risk",
+                "反序列化": "deserialization", "不安全反序列化": "deserialization",
+                "XXE": "xxe", "XML外部实体": "xxe",
+                "SSRF": "ssrf", "服务端请求伪造": "ssrf",
+                "代码执行": "code_exec", "远程代码执行": "code_exec", "RCE": "code_exec",
+                "路径遍历": "path_traversal", "目录遍历": "path_traversal",
+                "XSS": "xss", "跨站脚本": "xss",
+                "文件上传": "file_upload",
+            }
+            matched_cats = set()
+            for vul_keyword, cat in vuln_to_danger.items():
+                if vul_keyword in vul_name and cat in dangerous:
+                    matched_cats.add(cat)
+            if matched_cats:
+                danger_hint = "\n## 该语言相关危险模式\n"
+                for cat in matched_cats:
+                    patterns = dangerous[cat]
+                    danger_hint += f"- **{cat}**: {', '.join(patterns[:5])}\n"
+                system_content += danger_hint
+
+        # 注入快速检索规则
+        grep_rules = get_grep_rules(vul_name)
+        if grep_rules:
+            grep_hint = "\n## 快速检索规则\n"
+            for rule in grep_rules[:5]:
+                grep_hint += f"- `{rule['pattern']}`: {rule['description']}\n"
+            system_content += grep_hint
+
+        # 注入 Source→Sink→Safety 检测模式（按需，仅匹配当前语言和漏洞类型）
+        detection_hint = format_detection_patterns_for_prompt(lang_key, vul_name)
+        if detection_hint:
+            system_content += detection_hint
+
+        # 注入语言专属检查清单（按需，仅匹配当前语言）
+        lang_checklist = get_language_checklist(lang_key)
+        if lang_checklist:
+            system_content += "\n\n" + lang_checklist
+
+        # 注入快速扫描线索（按需，仅匹配当前漏洞类型）
+        quick_scan_hint = self._build_quick_scan_hint(vul_name, language)
+        if quick_scan_hint:
+            system_content += quick_scan_hint
+
+        # 注入防漏报兜底盲区提示（按需，仅匹配当前漏洞类型）
+        gapfill_hint = self._build_gapfill_hint(vul_name)
+        if gapfill_hint:
+            system_content += gapfill_hint
+
+        # RAG 按需知识检索（仅检索与当前漏洞类型相关的知识文档）
+        rag_hint = self._build_rag_hint(vul_name)
+        if rag_hint:
+            system_content += rag_hint
+
+        # 注入漏洞类型审计指南（框架感知检测矩阵、危险模式示例、CWE/国标）
+        try:
+            from src.knowledge.audit_vulnerability_guides import get_vulnerability_guide
+            vul_guide = get_vulnerability_guide(vul_name)
+            if vul_guide:
+                system_content += "\n\n" + vul_guide
+        except Exception:
+            pass
+
+        # 注入安全领域 MD（按漏洞类型匹配）
+        try:
+            from src.knowledge.md_loader import inject_domain_knowledge
+            domain_md = inject_domain_knowledge(vul_name, max_domains=2)
+            if domain_md:
+                system_content += domain_md
+        except Exception:
+            pass
+
+        # 注入框架安全 MD（按语言匹配）
+        try:
+            from src.knowledge.md_loader import inject_framework_knowledge
+            framework_md = inject_framework_knowledge(language, max_frameworks=2)
+            if framework_md:
+                system_content += framework_md
+        except Exception:
+            pass
+
         msg = [
             {"role": "system",
-             "content": sink_finder_prompt},
+             "content": system_content},
             {"role": "user", "content": "项目信息：\n" + self._brain.project_info},
             {"role": "user",
              "content": f"本次审计**目标**：\n语言：{language}\n漏洞类型：{vul_name} \n漏洞描述：{risk_description}\n相关依据:{reasoning_basis}"}
         ]
-        # code_agent = self._brain.get_tool("code_agent")
-        # code_agent_sid = code_agent.fork(self._brain.get_project_info_session_id())
-        code_agent_sid = ""
+        # code_agent 已移除，sink 发现改为原生工具多轮 LLM 循环
         result_file_path = str(self._brain.tmp_dir / f"{generate_uuid()}.txt")
 
         sink_res = []
-
-        def _build_tool_msg(base_msg: str) -> str:
-            goal_msg = f'''[约束]
-本任务中的结果项表示“安全待检查点”，不是狭义最终 sink，也不是所有经过数据流的中间节点。
-
-仅输出在目标漏洞语义下具有独立审查价值的代码位置。一个位置只有在满足以下任一条件时才应输出：
-- 动态数据、资源标识、控制条件、状态变更或敏感操作在此形成了可独立审查的完整安全语义；
-- 该位置与后续安全关键执行点存在直接语义关联，且其风险原因可被清晰说明；
-- 该位置承载了关键约束、边界判定、危险构造或缓解失效的核心语义。
-
-请避免以下情况：
-- 不要把函数/方法定义行作为结果，除非函数定义本身就是最小必要的安全语义承载点；
-- 不要把普通中间变量、局部赋值、纯拼接子表达式拆分成多个结果；
-- 不要仅因某函数参与数据流就将其作为结果；
-- 对同一条风险语义链，只保留最接近语义闭合、最利于人工审查的位置。\n[目标]针对{language}代码，以\"{vul_name}\"为目标做语义驱动的 sink 发现，借助\"GitNexus\"工具，找出所有可能的sink点。不要调用子代理。\n\n[指令]'''
-            return goal_msg + base_msg
-
-        def _run_code_agent_once(tool_name: str, session_id: str, tool_msg: str, event_span: EventSpan):
-            arguments = {
-                "msg": tool_msg,
-                "session_id": session_id,
-                "result_file_flag": True,
-                "result_file_path": result_file_path,
-                "output": """格式：
-[
-  {
-    "file": 项目根目录的相对路径,
-    "line": 起始行号,
-    "end_line": 结束行号,
-    "function": 如果位于方法内则填写 function_name，否则为空,
-    "related_exec": "(项目根目录的相对路径)file:line:function_name" 当前节点在项目内部调用链中直接关联的下一个安全关键操作位置（仅保留语义层关键点，不包含底层引擎调用,如果是方法调用则应该是该方法源码所在的位置）可以为空,
-    "reason": 原因说明
-  },
-  ...
-]
-【related_exec 填写规则】
-1. 方向性约束：related_exec 必须指向当前函数体内**直接调用**的下一个安全关键操作，绝不可填写“谁调用了当前函数”（上游调用者）。
-2. 验证步骤：填写前必须逐行检查当前函数体内的所有函数调用语句，确认是否存在安全关键调用。
-3. 空值条件：若当前函数体内未调用任何安全关键函数，related_exec 必须为空字符串 ""。
-4. 禁止推断：不得根据函数名或上下文猜测调用关系，必须以代码中实际存在的调用语句为准。
-""",
-            }
-            return self._run_code_agent(tool_name, arguments, event_span)
-
-        def _run_code_agent_repair_once(tool_name: str, session_id: str, fix_detail: str, event_span: EventSpan):
-            repair_msg = "请根据以下错误信息修复结果并重新生成：\n" + fix_detail
-            arguments = {
-                "msg": repair_msg,
-                "session_id": session_id,
-            }
-            return self._run_code_agent(tool_name, arguments, event_span)
 
         sink_finder_span = start_event_span(
             task_id=self._brain.task_id,
@@ -679,7 +853,7 @@ class SinkFinder(BaseAgent):
         self._publish_log(
             "INFO",
             f"[SinkFinder] 开始 sink 发现 | language={language} vul_name={vul_name} "
-            f"vul_node_id={vul_node_id} result_file={result_file_path}",
+            f"vul_node_id={vul_node_id}",
         )
         input_tokens, output_tokens = 0, 0
         for step in range(self.max_retries):
@@ -691,8 +865,6 @@ class SinkFinder(BaseAgent):
             try:
                 res, input_tokens, output_tokens = self._llm_step(msg)
             except LLMError:
-                # LLM 致命错误（额度/鉴权等）：向上抛出，使任务标记失败，
-                # 不能继续重试并最终标记 sink_finder 完成。
                 sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
                 sink_finder_span.mark_failed("LLM 调用发生致命错误")
                 raise
@@ -712,236 +884,111 @@ class SinkFinder(BaseAgent):
                 sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
                 tb = traceback.format_exc()
                 tail = tb[-4000:] if len(tb) > 4000 else tb
-                self._publish_log(
-                    "ERROR",
-                    f"[SinkFinder] LLM 调用异常: {e!r}\n{tail}",
-                )
+                self._publish_log("ERROR", f"[SinkFinder] LLM 调用异常: {e!r}\n{tail}")
                 raise RuntimeError(f"调用 LLM 时发生错误: {e}") from e
+
             if res is None:
                 sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                self._publish_log(
-                    "WARNING",
-                    f"[SinkFinder] LLM 返回为空，重试 ({step + 1}/{self.max_retries})",
-                )
+                self._publish_log("WARNING", f"[SinkFinder] LLM 返回为空，重试 ({step + 1}/{self.max_retries})")
                 continue
-            # ask() 成功时返回解析后的 dict/list
-            envelope = res
 
-            # 2) 读 next_action
-            next_action = (envelope or {}).get("next_action", {}) or {}
+            next_action = (res or {}).get("next_action", {}) or {}
             action_type = next_action.get("type", "")
 
-            # 3) 如果 tool_call：执行工具
+            # ---- 工具调用（所有工具均可使用） ----
             if action_type == "tool_call":
                 tool_name = next_action.get("tool_name", "")
-                if tool_name != "code_agent":
+                if not tool_name:
                     sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                    self._publish_log(
-                        "WARNING",
-                        f"[SinkFinder] 非法工具调用 tool_name={tool_name!r}，仅允许 code_agent",
-                    )
                     msg.append({
                         "role": "user",
                         "content": json.dumps({
-                            "error": "INVALID_TOOL_Arguments",
-                            "detail": "tool调用错误，只允许code_agent",
-                            "requirement": "tool调用错误，只允许code_agent"
-                        }, ensure_ascii=False)
-                    })
-                    continue
-                arguments = next_action.get("arguments") or {}
-                tool_msg = arguments.get("msg", "")
-                if tool_msg == "":
-                    sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                    self._publish_log("WARNING", "[SinkFinder] code_agent 调用缺少 msg 参数")
-                    msg.append({
-                        "role": "user",
-                        "content": json.dumps({
-                            "error": "INVALID_TOOL_Arguments",
-                            "detail": "msg 参数缺失或为空",
-                            "requirement": "msg参数错误"
+                            "error": "MISSING_TOOL_NAME",
+                            "requirement": "tool_call 需要提供 tool_name"
                         }, ensure_ascii=False)
                     })
                     continue
 
-                self._publish_log(
-                    "INFO",
-                    f"[SinkFinder] 调用 code_agent | result_file={result_file_path} "
-                    f"msg_preview={tool_msg[:200]}{'...' if len(tool_msg) > 200 else ''}",
-                )
-                code_agent_span = start_event_span(
+                self._publish_log("INFO", f"[SinkFinder] 调用工具 {tool_name!r} (轮 {step + 1})")
+                tool_span = start_event_span(
                     task_id=self._brain.task_id,
                     module=self.MODULE_NAME,
                     action_type=ActionType.TOOL_CALL,
-                    tool_name="code_agent",
-                    reason=tool_msg,
-                    tool_arguments={"msg": tool_msg},
+                    tool_name=tool_name,
+                    reason=f"调用 {tool_name} 工具",
+                    tool_arguments=next_action.get('arguments', {}) or {},
                 )
-                # 4.1 先把assistant输出记录进对话
-                msg.append({"role": "assistant", "content": json.dumps(res, ensure_ascii=False)})
-                tool_msg = _build_tool_msg(tool_msg)
-                tool_msg = f"项目基本信息：{self._brain.project_info_compact}\n" + tool_msg
-                # 4.2 调用工具（统一返回dict）
-                try:
-                    tool_result = _run_code_agent_once(tool_name, code_agent_sid, tool_msg, code_agent_span)
-                except Exception as e:
-                    sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                    self._publish_log(
-                        "WARNING",
-                        f"[SinkFinder] code_agent 执行异常: {e!r}",
-                    )
+                tool_result = self._execute_tool_call(next_action, msg, tool_span)
+                tool_span.set_output(json.dumps(tool_result, ensure_ascii=False, default=str))
+                tool_span.add_llm_tokens(input_tokens, output_tokens)
+                if tool_result is None:
+                    tool_span.mark_failed("工具调用未返回结果")
+                else:
+                    tool_span.finish()
+                if tool_result is not None:
                     msg.append({
                         "role": "user",
                         "content": json.dumps({
-                            "error": "TOOL_EXECUTION_FAILED",
-                            "detail": str(e),
-                        }, ensure_ascii=False)
+                            "status": "TOOL_RESULT",
+                            "tool_name": tool_name,
+                            "result": tool_result,
+                        }, ensure_ascii=False, default=str),
+                    })
+                continue
+
+            # ---- final：LLM 直接产出 sink JSON 数组 ----
+            if action_type == "final":
+                final_output = res.get("final_output")
+                if not isinstance(final_output, list):
+                    self._publish_log("WARNING", "[SinkFinder] final 缺少有效的 final_output 数组")
+                    msg.append({
+                        "role": "user",
+                        "content": json.dumps({
+                            "error": "FINAL_WITHOUT_OUTPUT",
+                            "requirement": "type=final 时 final_output 必须是 JSON 数组",
+                        }, ensure_ascii=False),
                     })
                     continue
 
-                repair_success = False
-                for repair_round in range(1, self.max_retries + 1):
-                    if not tool_result.get("success", False):
-                        self._publish_log(
-                            "WARNING",
-                            f"[SinkFinder] code_agent 未成功 (修复轮 {repair_round}) | "
-                            f"error={tool_result.get('error')!r}",
-                        )
-                        fix_detail = json.dumps({
-                            "error": "TOOL_EXECUTION_UNSUCCESSFUL",
-                            "detail": tool_result.get("error", None) or "tool returned success=False",
-                        }, ensure_ascii=False)
-                        try:
-                            tool_result = _run_code_agent_repair_once(tool_name, code_agent_sid, fix_detail, code_agent_span)
-                            continue
-                        except Exception as e:
-                            code_agent_span.mark_failed(str(e))
-                            msg.append({
-                                "role": "user",
-                                "content": json.dumps({
-                                    "error": "TOOL_EXECUTION_FAILED",
-                                    "detail": str(e),
-                                }, ensure_ascii=False)
-                            })
-                            break
-
-                    if not os.path.exists(result_file_path):
-                        self._publish_log(
-                            "WARNING",
-                            f"[SinkFinder] 结果文件不存在 (修复轮 {repair_round}) | path={result_file_path}",
-                        )
-                        fix_detail = json.dumps({
-                            "error": "RESULT_FILE_MISSING",
-                            "detail": f"结果文件不存在,是否是不存在sink，如果不存在则写入空的数组结果到结果文件中: {result_file_path}",
-                        }, ensure_ascii=False)
-                        try:
-                            tool_result = _run_code_agent_repair_once(tool_name, code_agent_sid, fix_detail, code_agent_span)
-                            continue
-                        except Exception as e:
-                            code_agent_span.mark_failed(str(e))
-                            msg.append({
-                                "role": "user",
-                                "content": json.dumps({
-                                    "error": "TOOL_EXECUTION_FAILED",
-                                    "detail": str(e),
-                                }, ensure_ascii=False)
-                            })
-                            break
-
-                    try:
-                        with open(result_file_path, "r", encoding="utf-8") as f:
-                            raw_sink_res = parse_json(f.read())
-                    except (ValueError, OSError) as e:
-                        self._publish_log(
-                            "WARNING",
-                            f"[SinkFinder] 结果文件解析失败 (修复轮 {repair_round}) | "
-                            f"path={result_file_path} err={e!r}",
-                        )
-                        fix_detail = json.dumps({
-                            "error": "RESULT_FILE_READ_FAILED",
-                            "detail": str(e),
-                            "path": result_file_path,
-                        }, ensure_ascii=False)
-                        try:
-                            tool_result = _run_code_agent_repair_once(tool_name, code_agent_sid, fix_detail, code_agent_span)
-                            continue
-                        except Exception as e2:
-                            code_agent_span.mark_failed(str(e))
-                            msg.append({
-                                "role": "user",
-                                "content": json.dumps({
-                                    "error": "TOOL_EXECUTION_FAILED",
-                                    "detail": str(e2),
-                                }, ensure_ascii=False)
-                            })
-                            break
-
-                    normalized_sink_res, err = _validate_and_normalize_sink_res(
-                        raw_sink_res, self._brain.project_path
-                    )
-                    if err:
-                        self._publish_log(
-                            "WARNING",
-                            f"[SinkFinder] sink 格式校验失败 (修复轮 {repair_round}) | "
-                            f"code={err.get('code')} field={err.get('field')} index={err.get('index')} "
-                            f"message={err.get('message')}",
-                        )
-                        fix_detail = _build_invalid_sink_format_fix_detail(
-                            err,
-                            result_file_path=result_file_path,
-                            raw_sink_res=raw_sink_res,
-                        )
-                        try:
-                            tool_result = _run_code_agent_repair_once(tool_name, code_agent_sid, fix_detail, code_agent_span)
-                            continue
-                        except Exception as e:
-                            code_agent_span.mark_failed(str(e))
-                            msg.append({
-                                "role": "user",
-                                "content": json.dumps({
-                                    "error": "TOOL_EXECUTION_FAILED",
-                                    "detail": str(e),
-                                }, ensure_ascii=False)
-                            })
-                            break
+                self._publish_log("INFO", f"[SinkFinder] LLM 返回 final，sink 候选={len(final_output)}")
+                normalized, err = _validate_and_normalize_sink_res(final_output, self._brain.project_path)
+                if err:
                     self._publish_log(
-                        "INFO",
-                        f"[SinkFinder] code_agent 结果校验通过 | count={len(normalized_sink_res)}",
+                        "WARNING",
+                        f"[SinkFinder] sink 格式校验失败 | code={err.get('code')} "
+                        f"field={err.get('field')} message={err.get('message')}",
                     )
-                    start_event_span(
-                        task_id=self._brain.task_id,
-                        module=self.MODULE_NAME,
-                        action_type=ActionType.INFORMATION,
-                        reason=f"{language} 语言的 {vul_name} 类型共发现{len(normalized_sink_res)}条sink点",
-                    )
-                    sink_res = normalized_sink_res
-                    repair_success = True
-                    break
+                    fix_detail = json.dumps({
+                        "error": "INVALID_SINK_FORMAT",
+                        "validation": err,
+                        "schema_hint": _SINK_RES_SCHEMA_HINT,
+                        "requirement": "请修正上述 sink 项后重新输出 final",
+                    }, ensure_ascii=False)
+                    msg.append({"role": "user", "content": fix_detail})
+                    continue
 
-                if repair_success:
-                    code_agent_span.finish()
-                    break
-                self._publish_log(
-                    "WARNING",
-                    f"[SinkFinder] code_agent 结果修复未成功，继续 LLM 轮次 ({step + 1}/{self.max_retries})",
+                self._publish_log("INFO", f"[SinkFinder] sink 校验通过 | count={len(normalized)}")
+                start_event_span(
+                    task_id=self._brain.task_id,
+                    module=self.MODULE_NAME,
+                    action_type=ActionType.INFORMATION,
+                    reason=f"{language} 语言的 {vul_name} 类型共发现{len(normalized)}条sink点",
                 )
-                continue
-
-            if action_type == "final":
-                self._publish_log("INFO", "[SinkFinder] LLM 返回 final，结束主循环")
+                sink_res = normalized
                 break
+
+            # ---- 无效 action_type ----
             sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
             self._publish_log(
                 "WARNING",
-                f"[SinkFinder] 无效 next_action.type={action_type!r}，回喂纠正",
+                f"[SinkFinder] 无效 next_action.type={action_type!r} (轮 {step + 1})",
             )
-            # 5) action_type 不符合协议：回喂纠正
             msg.append({"role": "assistant", "content": json.dumps(res, ensure_ascii=False)})
             msg.append({
                 "role": "user",
                 "content": json.dumps({
                     "error": "INVALID_NEXT_ACTION",
-                    "requirement": "next_action.type 只能是 code_agent 或 final"
+                    "requirement": "next_action.type 只能是 tool_call 或 final"
                 }, ensure_ascii=False)
             })
             continue
@@ -949,7 +996,7 @@ class SinkFinder(BaseAgent):
         if not sink_res:
             self._publish_log(
                 "WARNING",
-                f"[SinkFinder] 主循环结束但未发现 sink | max_retries={self.max_retries}",
+                f"[SinkFinder] 主循环结束但未发现有效 sink | max_retries={self.max_retries}",
             )
 
         if sink_res:
@@ -970,7 +1017,6 @@ class SinkFinder(BaseAgent):
                     sink_res_backup,
                 )
             except LLMError:
-                # LLM 致命错误（额度/鉴权等）：不可静默回退后继续标记完成，向上抛出。
                 raise
             except Exception as e:
                 self._publish_log(
@@ -993,7 +1039,6 @@ class SinkFinder(BaseAgent):
         )
         mark_risk_category_sink_finder_completed(vul_node_id)
         sink_finder_span.finish()
-        # 同时把 nodes 原样返回（方便后续落库时直接 MERGE）
         return {"nodes": sink_nodes, **flow}
 
 

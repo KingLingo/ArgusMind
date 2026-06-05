@@ -24,6 +24,7 @@ fork 的每条分支与 insert_node 使用完全相同的节点结构（type / f
 """
 import json
 import logging
+import os
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from src.agents.brain import Brain
 from src.agents.chain_confirmer import ChainConfirmer
 from src.core.task_control import TaskPausedError
 from src.llm import LLMError
+from src.services.context_compressor import ContextCompressor
 from src.agents.prompt.chain_analyzer import (
     chain_analyzer_system_prompt,
     chain_analyzer_force_conclude_prompt, chain_node_prompt,
@@ -56,6 +58,11 @@ from services.chain_analysis_service import (
 )
 from src.tools import ReadLinesTool
 from src.utils.ids import generate_id
+from src.knowledge import build_audit_system_prompt
+from src.knowledge.audit_skills import AUDIT_WORKFLOW, QUALITY_STANDARDS, COMBINED_VULN_PATTERNS, LINE_VERIFICATION_FLOW
+from src.knowledge.security_domains import SECURITY_DOMAINS, UNIVERSAL_SECURITY_HINTS
+from src.knowledge.detection_patterns import SECURITY_CHECKLIST, get_evidence_template
+from src.knowledge.gbt_standards import GBT_EVIDENCE_REQUIREMENTS
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +85,7 @@ class ChainAnalyzer(BaseAgent):
     多条独立分支，每条分支拥有隔离的对话上下文和 ChainNode 序列。
     """
     MODULE_NAME = "chain_analyzer"
-    DEFAULT_MAX_ROUNDS = 70
+    DEFAULT_MAX_ROUNDS = 35
     VERDICTS_NEED_CONFIRMATION = {"LIKELY_VULNERABLE"}
     VALID_FINAL_VERDICTS = frozenset({
         "LIKELY_VULNERABLE",
@@ -132,10 +139,102 @@ class ChainAnalyzer(BaseAgent):
                 return out
         return step
 
+    @staticmethod
+    def _remap_neo4j_file_path(file_path: str, project_path: str) -> str:
+        """
+        重映射 Neo4j 节点中可能存储的临时目录绝对路径。
+
+        当项目通过 ``source_type=upload|git`` 创建时，源码会被复制到临时目录
+        ``{TMP_BASE}/project/{uuid}/``，该路径可能被写入 Neo4j。实际部署/二次扫描
+        时临时目录可能已被清理，需要将路径重映射到当前项目根 ``project_path``。
+
+        返回重映射后的路径；非临时路径原样返回。
+        """
+        if not file_path or not os.path.isabs(file_path):
+            return file_path
+
+        from src.tmp_dir import get_tmp_base
+        tmp_base = str(get_tmp_base()).replace("\\", "/")
+        project_prefix = f"{tmp_base}/project/"
+        norm_path = file_path.replace("\\", "/")
+
+        if not norm_path.startswith(project_prefix):
+            return file_path
+
+        # norm_path = {tmp_base}/project/{uuid}/rel/path/file.java
+        # rest      = {uuid}/rel/path/file.java
+        rest = norm_path[len(project_prefix):]
+        first_slash = rest.find("/")
+        if first_slash == -1:
+            return file_path  # 只有 {uuid}，没有相对路径，无法映射
+        rel_path = rest[first_slash + 1:]  # rel/path/file.java
+
+        actual_root = str(project_path).replace("\\", "/")
+        return os.path.normpath(f"{actual_root}/{rel_path}")
+
     def __init__(self, brain: Optional[Brain] = None, max_rounds: int = DEFAULT_MAX_ROUNDS):
         super().__init__(brain=brain)
         self.max_rounds = max_rounds
         self._confirmer = ChainConfirmer(brain=brain)
+        # 上下文压缩器：防止多轮对话（max 70 轮）token 溢出
+        self._context_compressor: Optional[ContextCompressor] = None
+
+    def _init_compressor(self) -> None:
+        """懒初始化上下文压缩器（需要 brain 已设置）。"""
+        if self._context_compressor is not None:
+            return
+        if self._brain is None or self._brain.llm is None:
+            return
+
+        def _ask_wrapper(messages: List[Dict[str, str]]):
+            """将 brain.ask 的 (result, in_tok, out_tok) 适配为压缩器的签名。"""
+            result, in_tok, out_tok = self._brain.ask(messages)
+            content = result.get("content", "") if isinstance(result, dict) else str(result)
+            return content, in_tok, out_tok
+
+        self._context_compressor = ContextCompressor(
+            ask_fn=_ask_wrapper,
+            max_history_tokens=8000,
+        )
+
+    def _maybe_compress(
+        self,
+        conversation: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        """在每轮 LLM 调用后检查是否需要压缩对话历史。
+
+        压缩策略：
+        - 消息数 ≤ 12 时不压缩（对话还在构建阶段）
+        - 估算 token 超过 8000 时触发压缩
+        - 压缩保留 system 消息 + 结构化摘要 + 最近 4 条消息
+        """
+        if self._context_compressor is None:
+            self._init_compressor()
+        if self._context_compressor is None:
+            return conversation  # 脱机模式或无 LLM，跳过压缩
+
+        # 消息太少时不压缩
+        non_system = [m for m in conversation if m.get("role") != "system"]
+        if len(non_system) <= 12:
+            return conversation
+
+        if not self._context_compressor.should_compress(conversation):
+            return conversation
+
+        system_msg = conversation[0] if conversation and conversation[0].get("role") == "system" else None
+        try:
+            compressed = self._context_compressor.apply_compression(conversation, system_msg)
+            self._publish_log(
+                "INFO",
+                f"[ChainAnalyzer] 上下文压缩完成: {len(conversation)} 条消息 → {len(compressed)} 条",
+            )
+            return compressed
+        except Exception as e:
+            self._publish_log(
+                "WARNING",
+                f"[ChainAnalyzer] 上下文压缩失败，继续使用原始对话: {e!r}",
+            )
+            return conversation
 
     # ==================================================================
     # 公共入口
@@ -443,24 +542,13 @@ class ChainAnalyzer(BaseAgent):
         inserted_chain_nodes: List[Dict[str, Any]] = []
         all_results: List[Dict[str, Any]] = []
         consecutive_invalid_action = 0
-        sink_chain_desc = " → ".join(
-            f"{node.get('function', '?')}(elementId={node.get('elementId', '') or '-'})"
-            for node in sink_nodes
-        ) if sink_nodes else "(无 sink_nodes)"
-        start_event_span(
-            task_id=self._brain.task_id,
-            module=self.MODULE_NAME,
-            action_type=ActionType.INFORMATION,
-            reason=(
-                f"开始分析链路 | branch_id={branch_id or '(root)'} | "
-                f"category={category_name} | sinks={sink_chain_desc}"
-            ),
-        )
+        consecutive_tool_only = 0
+        max_tool_only = 12
         info_span = start_event_span(
             task_id=self._brain.task_id,
             module=self.MODULE_NAME,
-            action_type="",
-            reason="",
+            action_type=ActionType.INFORMATION,
+            reason=f"开始链路分析循环 | branch_id={branch_id or '(root)'} | category={category_name}",
         )
         self._publish_log(
             "INFO",
@@ -498,6 +586,9 @@ class ChainAnalyzer(BaseAgent):
                 "final_resolution",
             ):
                 consecutive_invalid_action = 0
+
+            if action in ("fork", "insert_node", "record_info", "final_resolution"):
+                consecutive_tool_only = 0
 
             # --- tool_call ---
             if action == "tool_call":
@@ -546,6 +637,28 @@ class ChainAnalyzer(BaseAgent):
                     else json.dumps(tool_result, ensure_ascii=False, default=str)
                 )
                 tool_span.finish()
+
+                # 连续 tool_only 达到阈值 → 提前强制收口
+                consecutive_tool_only += 1
+                if consecutive_tool_only >= max_tool_only:
+                    self._publish_log(
+                        "WARNING",
+                        f"[ChainAnalyzer] 连续 {consecutive_tool_only} 轮仅调用工具无进展，"
+                        f"提前进入强制收口 (轮 {round_num})",
+                    )
+                    info_span.finish()
+                    resolution = self._force_conclude(
+                        conversation=conversation,
+                        trace_tail=trace_tail,
+                        branch_id=branch_id,
+                        inserted_chain_nodes=inserted_chain_nodes,
+                        category_name=category_name,
+                        risk_description=risk_description,
+                        knowledge_element_id=knowledge_element_id,
+                    )
+                    all_results.append(resolution)
+                    self._report_cache_stats(self._brain.task_id)
+                    return all_results
                 continue
             logger.debug("[ChainAnalyzer] step=%s", json.dumps(step, ensure_ascii=False))
             # --- fork ---
@@ -599,6 +712,7 @@ class ChainAnalyzer(BaseAgent):
                     f"[ChainAnalyzer] fork 完成 | results={len(fork_results)}",
                 )
                 info_span.finish()
+                self._report_cache_stats(self._brain.task_id)
                 return all_results
 
             # --- insert_node ---
@@ -648,6 +762,7 @@ class ChainAnalyzer(BaseAgent):
                 )
                 all_results.extend(fork_results)
                 info_span.finish()
+                self._report_cache_stats(self._brain.task_id)
                 return all_results
 
             # --- record_info ---
@@ -810,6 +925,7 @@ class ChainAnalyzer(BaseAgent):
                 )
                 all_results.append(resolution)
                 info_span.finish()
+                self._report_cache_stats(self._brain.task_id)
                 return all_results
 
             # unknown action
@@ -830,12 +946,16 @@ class ChainAnalyzer(BaseAgent):
                 conversation, consecutive_invalid_action
             )
 
+            # 每轮结束后压缩上下文（防止 70 轮对话 token 溢出）
+            conversation = self._maybe_compress(conversation)
+
         # 超过最大轮次 → 强制收口
         self._publish_log(
             "WARNING",
             f"[ChainAnalyzer] 已达最大轮次 {self.max_rounds}，进入强制收口 | branch_id={branch_id or '(root)'}",
         )
         info_span.finish()
+        self._report_cache_stats(self._brain.task_id)
         resolution = self._force_conclude(
             conversation=conversation,
             trace_tail=trace_tail,
@@ -1063,6 +1183,124 @@ class ChainAnalyzer(BaseAgent):
             project_info=self._brain.project_info_compact or "(无项目信息)",
             tool_registry=tool_schema,
         )
+
+        # 注入知识库审计增强提示词
+        audit_enhancement = build_audit_system_prompt(
+            language=category_name,
+            include_priority_layers=False,
+            include_severity_guide=True,
+            include_evidence_contract=True,
+            include_dedup_rules=True,
+            include_dual_verdict=True,
+            include_language_rules=False,
+        )
+        if audit_enhancement:
+            system_content += "\n\n" + audit_enhancement
+
+        # 注入安全领域检查清单（按漏洞类型精确匹配）
+        _VULN_TO_DOMAIN = {
+            "认证": "authentication_authorization", "授权": "authentication_authorization",
+            "越权": "authentication_authorization", "IDOR": "authentication_authorization",
+            "会话": "session_management", "Session": "session_management",
+            "输入验证": "input_validation", "注入": "input_validation",
+            "SQL注入": "input_validation", "XSS": "input_validation",
+            "命令注入": "input_validation", "代码执行": "input_validation",
+            "加密": "cryptography", "密码": "cryptography", "密钥": "cryptography",
+            "业务逻辑": "business_logic", "竞态": "race_conditions",
+            "文件": "file_operations", "上传": "file_operations", "路径遍历": "file_operations",
+            "API": "api_security", "CORS": "api_security",
+            "依赖": "dependencies", "组件": "dependencies",
+            "信息泄露": "information_disclosure", "泄露": "information_disclosure",
+            "SSRF": "api_security",
+            "反序列化": "input_validation",
+        }
+        matched_domain_id = None
+        for keyword, domain_id in _VULN_TO_DOMAIN.items():
+            if keyword in category_name:
+                matched_domain_id = domain_id
+                break
+        if matched_domain_id and matched_domain_id in SECURITY_DOMAINS:
+            domain_data = SECURITY_DOMAINS[matched_domain_id]
+            checks = domain_data.get("checks", [])
+            if checks:
+                system_content += f"\n\n## {domain_data.get('title', '')}检查清单\n"
+                for chk in checks[:5]:
+                    system_content += f"- {chk}\n"
+
+        # 注入组合漏洞分析模式（仅在涉及多漏洞组合场景时注入）
+        _COMBO_KEYWORDS = ["组合", "链式", "利用链", "攻击链", "SSRF", "RCE", "XSS", "CSRF", "注入"]
+        if any(kw in category_name for kw in _COMBO_KEYWORDS):
+            system_content += "\n\n" + COMBINED_VULN_PATTERNS
+
+        # 注入通用安全检查清单（精简版，仅注入与当前漏洞类型相关的部分）
+        _CHECKLIST_SECTIONS = {
+            "注入": "### 注入", "SQL": "### 注入", "XSS": "### 注入", "命令": "### 注入",
+            "认证": "### 认证与授权", "授权": "### 认证与授权", "越权": "### 认证与授权",
+            "敏感数据": "### 敏感数据", "加密": "### 敏感数据", "密码": "### 敏感数据",
+            "文件": "### 文件操作", "上传": "### 文件操作", "路径遍历": "### 文件操作",
+            "反序列化": "### 反序列化",
+        }
+        matched_section = None
+        for kw, section_header in _CHECKLIST_SECTIONS.items():
+            if kw in category_name:
+                matched_section = section_header
+                break
+        if matched_section and matched_section in SECURITY_CHECKLIST:
+            section_start = SECURITY_CHECKLIST.find(matched_section)
+            if section_start >= 0:
+                # 找到下一个 ### 或文件末尾
+                next_section = SECURITY_CHECKLIST.find("\n### ", section_start + 1)
+                section_content = SECURITY_CHECKLIST[section_start:next_section] if next_section > 0 else SECURITY_CHECKLIST[section_start:]
+                system_content += "\n\n## 安全检查清单（相关部分）\n" + section_content.strip()
+
+        # 注入证据点模板（按需，仅匹配当前漏洞类型）
+        evidence_template = get_evidence_template(category_name)
+        if evidence_template:
+            system_content += "\n\n## 证据要求\n"
+            system_content += f"- 必须包含: {', '.join(evidence_template['required_evidence'])}\n"
+            system_content += f"- 安全信号(kill switch): {', '.join(evidence_template['kill_switch_signals'])}\n"
+
+        # 注入漏洞类型审计指南（框架感知检测矩阵、危险模式示例、CWE/国标）
+        try:
+            from src.knowledge.audit_vulnerability_guides import get_vulnerability_guide
+            vul_guide = get_vulnerability_guide(category_name)
+            if vul_guide:
+                system_content += "\n\n" + vul_guide
+        except Exception:
+            pass
+
+        # 注入安全检查清单（按漏洞类型精确匹配）
+        try:
+            from src.services.security_checklist import get_security_checklist
+            checklist = get_security_checklist(category_name)
+            if checklist:
+                system_content += "\n\n" + checklist
+        except Exception:
+            pass
+
+        # 注入 GB/T 证据要求（当漏洞类型有 GB/T 映射时）
+        from src.knowledge.gbt_standards import VULN_GBT_MAP
+        if category_name in VULN_GBT_MAP or any(kw in category_name for kw in VULN_GBT_MAP):
+            system_content += "\n\n" + GBT_EVIDENCE_REQUIREMENTS
+
+        # 注入安全领域 MD（按漏洞类型匹配：business_logic, oauth_oidc_saml, input_validation 等）
+        try:
+            from src.knowledge.md_loader import inject_domain_knowledge
+            domain_md = inject_domain_knowledge(category_name, max_domains=2)
+            if domain_md:
+                system_content += domain_md
+        except Exception:
+            pass
+
+        # 注入 GB/T 漏洞审计细则 MD（按漏洞类型匹配）
+        try:
+            from src.knowledge.md_loader import inject_gbt_vuln_knowledge
+            gbt_md = inject_gbt_vuln_knowledge(category_name)
+            if gbt_md:
+                system_content += gbt_md
+        except Exception:
+            pass
+
         user_content = chain_node_prompt.format(
             risk_category=category_name,
             risk_description=risk_description,
@@ -1122,7 +1360,8 @@ class ChainAnalyzer(BaseAgent):
         line_info_by_eid = fetch_node_lines_by_element_ids(missing_line_eids) if missing_line_eids else {}
 
         for i, node in enumerate(sink_nodes):
-            file_path = node.get('file', '') or ''
+            raw_file_path = node.get('file', '') or ''
+            file_path = self._remap_neo4j_file_path(raw_file_path, self._brain.project_path)
             line = node.get('line', '') or ''
             end_line = node.get('end_line', '') or ''
 

@@ -19,17 +19,20 @@ from src.core.events import (
 def handle_event_start(ev: EventStart) -> None:
     from src.services import event_service
 
-    event = event_service.create_event(
-        task_id=ev.task_id,
-        module=ev.module,
-        action_type=ev.action_type,
-        tool_name=ev.tool_name,
-
-        reason=ev.reason,
-        tool_arguments=ev.tool_arguments,
-        status=ev.status,
-    )
-    ev.set_result(event.id)
+    try:
+        event = event_service.create_event(
+            task_id=ev.task_id,
+            module=ev.module,
+            action_type=ev.action_type,
+            tool_name=ev.tool_name,
+            reason=ev.reason,
+            tool_arguments=ev.tool_arguments,
+            status=ev.status,
+        )
+        ev.set_result(event.id)
+    except Exception:
+        # 任务可能已被删除（FK 约束失败），静默忽略
+        pass
 
 
 def handle_event_end(ev: EventEnd) -> None:
@@ -72,8 +75,12 @@ def handle_token_event(ev: TokenEvent) -> None:
 def handle_log_event(ev: LogEvent) -> None:
     from src.services.log_service import write_log
 
-    entry = write_log(level=ev.level, module=ev.module, message=ev.message, task_id=ev.task_id)
-    ev.set_result(entry.id)
+    try:
+        entry = write_log(level=ev.level, module=ev.module, message=ev.message, task_id=ev.task_id)
+        ev.set_result(entry.id)
+    except Exception:
+        # 任务可能已被删除（FK 约束失败），静默忽略
+        pass
 
 
 
@@ -93,6 +100,8 @@ def handle_task_status_event(ev: TaskStatusEvent) -> None:
         task.status = ev.status
         if ev.message:
             task.error = ev.message if ev.status == "failed" else task.error
+        if ev.vuln_count:
+            task.vuln_count = ev.vuln_count
         if ev.status in {"completed", "failed", "cancelled"} and task.finished_at is None:
             task.finished_at = datetime.utcnow()
         if ev.status == "paused" and task.finished_at is not None:

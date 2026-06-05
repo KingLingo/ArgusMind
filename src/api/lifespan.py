@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 
@@ -65,6 +66,32 @@ async def lifespan(app: FastAPI):
         logger.info("[lifespan] 暂停任务状态已从数据库恢复")
     except Exception as ex:  # pragma: no cover
         logger.warning("[lifespan] 恢复暂停任务状态失败: %s", ex)
+
+    # 启动时清理遗留的 running/paused 任务（进程重启后旧任务已失去执行线程）
+    try:
+        from src.infrastructure.db import session_scope
+        from src.infrastructure.db.models import Task as TaskModel
+        from src.core.task_control import get_task_control
+
+        ctrl = get_task_control()
+        with session_scope() as session:
+            orphaned = session.query(TaskModel).filter(
+                TaskModel.status.in_(["running", "paused"])
+            ).all()
+            if orphaned:
+                for t in orphaned:
+                    t.status = "failed"
+                    t.error = "服务重启，任务被动终止"
+                    t.finished_at = datetime.now(timezone.utc)
+                    ctrl.clear_stopped(t.id)
+                    ctrl.clear_paused(t.id)
+                session.commit()
+                logger.info(
+                    "[lifespan] 已将 %d 个遗留 running/paused 任务标记为 failed，内存标记已清理",
+                    len(orphaned),
+                )
+    except Exception as ex:  # pragma: no cover
+        logger.warning("[lifespan] 清理遗留 running 任务失败: %s", ex)
     try:
         ensure_tool_dependencies_at_startup()
         logger.info("[lifespan] 工具依赖检查完成")

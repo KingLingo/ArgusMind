@@ -12,6 +12,8 @@ class AuditTaskCreate(BaseModel):
 
     project_id: str = Field(..., alias="projectId")
     name: str = Field(..., max_length=255)
+    offline_mode: bool = Field(False, alias="offlineMode",
+                                description="脱机模式：仅使用规则引擎和快速扫描，不调用 LLM")
 
 
 class TaskUpdate(BaseModel):
@@ -26,12 +28,15 @@ class TaskRead(BaseModel):
     id: str
     project_id: str
     name: str
+    offline_mode: bool = False
     status: str
     todo: Optional[List[Dict[str, Any]]] = None
     llm_input_token: int = 0
     llm_output_token: int = 0
     code_agent_input_token: int = 0
     code_agent_output_token: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
     error: str = ""
     created_at: datetime
     finished_at: Optional[datetime] = None

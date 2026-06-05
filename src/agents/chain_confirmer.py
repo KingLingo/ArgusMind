@@ -30,6 +30,7 @@ from src.agents.prompt.chain_confirmer import (
 )
 from src.core.task_control import TaskPausedError
 from src.llm import LLMError
+from src.services.context_compressor import ContextCompressor
 from services.chain_analysis_service import update_analysis_result_verification, attach_audit_info_record
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,63 @@ class ChainConfirmer(BaseAgent):
     逐项验证核心安全假设，输出确认/驳回/待人工复审结论。
     """
     MODULE_NAME = "chain_confirmer"
-    DEFAULT_MAX_ROUNDS = 70
+    DEFAULT_MAX_ROUNDS = 35
     VERDICTS_NEED_CONFIRMATION = {"LIKELY_VULNERABLE"}
 
     def __init__(self, brain: Optional[Brain] = None, max_rounds: int = DEFAULT_MAX_ROUNDS):
         super().__init__(brain=brain)
         self.max_rounds = max_rounds
+        self._context_compressor: Optional[ContextCompressor] = None
+
+    # ---------- 上下文压缩 ----------
+
+    def _init_compressor(self) -> None:
+        """懒初始化上下文压缩器（需要 brain 已设置）。"""
+        if self._context_compressor is not None:
+            return
+        if self._brain is None or self._brain.llm is None:
+            return
+
+        def _ask_wrapper(messages: List[Dict[str, str]]):
+            result, in_tok, out_tok = self._brain.ask(messages)
+            content = result.get("content", "") if isinstance(result, dict) else str(result)
+            return content, in_tok, out_tok
+
+        self._context_compressor = ContextCompressor(
+            ask_fn=_ask_wrapper,
+            max_history_tokens=8000,
+        )
+
+    def _maybe_compress(
+        self,
+        conversation: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        if self._context_compressor is None:
+            self._init_compressor()
+        if self._context_compressor is None:
+            return conversation
+
+        non_system = [m for m in conversation if m.get("role") != "system"]
+        if len(non_system) <= 12:
+            return conversation
+
+        if not self._context_compressor.should_compress(conversation):
+            return conversation
+
+        system_msg = conversation[0] if conversation and conversation[0].get("role") == "system" else None
+        try:
+            compressed = self._context_compressor.apply_compression(conversation, system_msg)
+            self._publish_log(
+                "INFO",
+                f"[ChainConfirmer] 上下文压缩完成: {len(conversation)} 条消息 → {len(compressed)} 条",
+            )
+            return compressed
+        except Exception as e:
+            self._publish_log(
+                "WARNING",
+                f"[ChainConfirmer] 上下文压缩失败，继续使用原始对话: {e!r}",
+            )
+            return conversation
 
     def run(
         self,
@@ -285,14 +337,16 @@ class ChainConfirmer(BaseAgent):
         info_span = start_event_span(
             task_id=self._brain.task_id,
             module=self.MODULE_NAME,
-            action_type="",
-            reason="",
+            action_type=ActionType.REVIEW,
+            reason=f"开始确认循环 | max_rounds={self.max_rounds}",
         )
         self._publish_log(
             "INFO",
             f"[ChainConfirmer] 开始确认循环 | max_rounds={self.max_rounds}",
         )
         consecutive_invalid_action = 0
+        consecutive_tool_only = 0
+        max_tool_only = 8  # 连续 N 轮仅调用工具无结论 → 提前认为陷入僵局
 
         for round_num in range(1, self.max_rounds + 1):
             ensure_task_running(self._brain.task_id)
@@ -358,9 +412,22 @@ class ChainConfirmer(BaseAgent):
                     else json.dumps(tool_result, ensure_ascii=False, default=str)
                 )
                 tool_span.finish()
+
+                # 连续 tool_only 达到阈值 → 提前强制收口
+                consecutive_tool_only += 1
+                if consecutive_tool_only >= max_tool_only:
+                    self._publish_log(
+                        "WARNING",
+                        f"[ChainConfirmer] 连续 {consecutive_tool_only} 轮仅调用工具无结论，"
+                        f"提前结束 (轮 {round_num})",
+                    )
+                    info_span.finish()
+                    self._report_cache_stats(self._brain.task_id)
+                    return self._force_conclude(conversation)
                 continue
 
             if action == "record_info":
+                consecutive_tool_only = 0
                 info = step.get("info") or {}
                 target = info.get("target") or {}
                 raw_eid = target.get("elementId", "")
@@ -461,6 +528,7 @@ class ChainConfirmer(BaseAgent):
                 continue
 
             if action == "confirmation_result":
+                consecutive_tool_only = 0
                 result_preview = step.get("result", {})
                 self._publish_log(
                     "INFO",
@@ -484,6 +552,7 @@ class ChainConfirmer(BaseAgent):
                 )
                 confirm_span.finish()
                 info_span.finish()
+                self._report_cache_stats(self._brain.task_id)
                 return self._normalize_result(result, round_num)
 
             info_span.add_llm_tokens(input_tokens, output_tokens)
@@ -503,11 +572,15 @@ class ChainConfirmer(BaseAgent):
                 conversation, consecutive_invalid_action
             )
 
+            # 每轮结束后压缩上下文
+            conversation = self._maybe_compress(conversation)
+
         self._publish_log(
             "WARNING",
             f"[ChainConfirmer] 已达最大轮次 {self.max_rounds}，进入强制收口",
         )
         info_span.finish()
+        self._report_cache_stats(self._brain.task_id)
         return self._force_conclude(conversation)
 
     def _force_conclude(

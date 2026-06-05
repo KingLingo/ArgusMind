@@ -38,7 +38,7 @@ plan_prompt = '''# 代码审计计划制定专家 - 漏洞类型识别
 {
   "next_action": {
     "type": "tool_call | final",
-    "tool_name": "read_file | read_lines | list_files | tokei | null",
+    "tool_name": "read_file | read_lines | list_files | null",
     "arguments": { }
   },
   "final_output": null | <计划JSON>

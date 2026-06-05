@@ -114,19 +114,19 @@ def fetch_next_pending_language_for_plan(plan_stage_node_id: str) -> Optional[Di
     ORDER BY coalesce(toInteger(lang.level), 999999) ASC, lang.node_id ASC
     LIMIT 1
     """
-    records = repo.client.execute_write(cypher, {"plan_id": plan_stage_node_id})
+    records = repo.client.execute_read(cypher, {"plan_id": plan_stage_node_id})
     if not records:
         return None
     return records[0].data()
 
 
-def fetch_next_pending_risk_category_for_language(lang_node_id: str) -> Optional[Dict[str, Any]]:
+def fetch_all_pending_risk_categories(lang_node_id: str) -> List[Dict[str, Any]]:
     """
-    在指定 Language 下，取一个 status=pending 的 RiskCategory，按 level 升序，同级按 node_id 排序。
+    一次性查出指定 Language 下所有 status=pending 的 RiskCategory。
     """
     repo = db_manager.neo4j_repository
     if repo is None:
-        return None
+        return []
     cypher = """
     MATCH (lang:Language {node_id: $lang_node_id})-[:HAS_RISK_CATEGORY]->(cat:RiskCategory)
     WHERE cat.status = 'pending'
@@ -139,12 +139,9 @@ def fetch_next_pending_risk_category_for_language(lang_node_id: str) -> Optional
            cat.task_id AS task_id,
            coalesce(cat.sink_finder_completed, false) AS sink_finder_completed
     ORDER BY coalesce(toInteger(cat.level), 999999) ASC, cat.node_id ASC
-    LIMIT 1
     """
-    records = repo.client.execute_write(cypher, {"lang_node_id": lang_node_id})
-    if not records:
-        return None
-    return records[0].data()
+    records = repo.client.execute_read(cypher, {"lang_node_id": lang_node_id})
+    return [r.data() for r in records]
 
 
 def reset_running_audit_nodes_to_pending_for_task(task_id: str) -> int:

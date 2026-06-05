@@ -17,3 +17,4 @@ class BrainContext:
     project_path: str
     task_id: str
     llm_config: LLMConfig
+    offline_mode: bool = False

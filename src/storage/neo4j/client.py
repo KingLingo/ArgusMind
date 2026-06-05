@@ -25,6 +25,8 @@ class Neo4jClient:
         self.driver = GraphDatabase.driver(
             config.uri,
             auth=(config.user, config.password),
+            connection_acquisition_timeout=30.0,
+            max_transaction_retry_time=15.0,
         )
         self._max_retries = max(1, max_retries)
         self._retry_base_delay_sec = max(0.05, retry_base_delay_sec)

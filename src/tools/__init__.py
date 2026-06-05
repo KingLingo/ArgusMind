@@ -20,10 +20,19 @@ from src.tools.ripgrep import RipgrepFilesTool, RipgrepSearchTool
 from src.tools.registry import ToolRegistry, get_default_registry
 from src.tools.tokei import TokeiTool
 
-try:
-    from src.tools.opencode import OpenCodeTool
-except Exception:  # opencode_ai 未安装或导入失败
-    OpenCodeTool = None  # type: ignore[misc, assignment]
+# OpenCodeTool 按需延迟加载（避免启动时 sandbox 阻断）
+OpenCodeTool = None  # type: ignore[assignment]
+
+
+def _get_opencode_tool():
+    global OpenCodeTool
+    if OpenCodeTool is None:
+        try:
+            from src.tools.opencode import OpenCodeTool as _OTC
+            OpenCodeTool = _OTC
+        except Exception:
+            pass
+    return OpenCodeTool
 
 
 def __getattr__(name: str):

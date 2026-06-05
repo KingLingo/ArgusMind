@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import List, Optional, Tuple, cast
 from urllib.parse import urlparse
 
+from sqlalchemy import text
+
 from src.api.exceptions import AppException
 from src.tmp_dir import ensure_tmp_base
+from src.core.code_agent_run_registry import abort_code_agent_for_task
 from src.infrastructure.db import session_scope
 from src.infrastructure.db.models import Project
+from src.services.graph_service import delete_task_neo4j_data
 from src.repositories.project_repository import ProjectListRow, ProjectRepository
 from src.schemas.common import IdNameItem
 from src.schemas.project import (
@@ -399,16 +403,33 @@ def update_project(project_id: str, data: ProjectUpdate) -> Optional[Project]:
 
 
 def delete_project(project_id: str) -> bool:
+    task_ids: List[str] = []
     with session_scope() as session:
         repo = ProjectRepository(session)
         project = repo.get(project_id)
         if project is None:
             return False
+
+        # 收集项目下的所有 task_id（用于后续清理 Neo4j 和中止 agent）
+        rows = session.execute(
+            text("SELECT id FROM tasks WHERE project_id = :pid"),
+            {"pid": project_id},
+        )
+        task_ids = [r[0] for r in rows]
+
+        # 删除磁盘工作目录
         project_path_raw = (project.storage_path or project.path or "").strip()
         if project_path_raw:
             base_dir = _resolve_project_base_dir()
             project_path = _ensure_child_path(base_dir, Path(project_path_raw).expanduser().resolve())
             if project_path.exists():
                 shutil.rmtree(project_path, ignore_errors=False)
+
         repo.delete(project)
-        return True
+
+    # 事务已提交，PG CASCADE 已完成；清理 Neo4j 和中止正在运行的 agent
+    for tid in task_ids:
+        abort_code_agent_for_task(tid, reason="project_deleted")
+        delete_task_neo4j_data(tid)
+
+    return True

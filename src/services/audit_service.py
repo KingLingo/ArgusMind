@@ -24,7 +24,7 @@ class AuditConfigMissing(Exception):
     pass
 
 
-def run_task(task_id: str, project_id: Optional[str] = None) -> None:
+def run_task(task_id: str, project_id: Optional[str] = None, offline_mode: bool = False) -> None:
     """同步执行一个审计任务。"""
     bus = get_event_bus()
 
@@ -34,12 +34,7 @@ def run_task(task_id: str, project_id: Optional[str] = None) -> None:
         bus.publish(LogEvent(level="INFO", module="audit", message=f"任务 {task_id} 处于暂停状态，跳过执行", task_id=task_id))
         return
 
-    llm_cfg = get_llm_runtime_config()
-    if llm_cfg is None:
-        raise AuditConfigMissing("LLM_config 未配置（provider/key/model 必填）")
-    opencode_cfg = get_opencode_runtime_config()
-
-    # 快照项目与任务基础信息（短事务）
+    # 快照项目与任务基础信息（短事务）—— 优先读取 offline_mode
     project_name: str = ""
     project_path: str = ""
     resolved_project_id: str = ""
@@ -61,6 +56,20 @@ def run_task(task_id: str, project_id: Optional[str] = None) -> None:
                     project_name = project.name
                     project_path = project.path
 
+        # 始终从 Task 读取 offline_mode（重跑/恢复时不传此参数）
+        if not offline_mode:
+            task_record = session.get(Task, task_id)
+            if task_record is not None:
+                offline_mode = getattr(task_record, "offline_mode", False)
+
+    # 脱机模式不需要 LLM 配置；非脱机模式必须配置 LLM
+    llm_cfg = None
+    if not offline_mode:
+        llm_cfg = get_llm_runtime_config()
+        if llm_cfg is None:
+            raise AuditConfigMissing("LLM_config 未配置（provider/key/model 必填）")
+    opencode_cfg = get_opencode_runtime_config() if not offline_mode else None
+
     if not project_path:
         bus.publish(
             EventStart(
@@ -76,10 +85,17 @@ def run_task(task_id: str, project_id: Optional[str] = None) -> None:
         )
         return
 
-    bus.publish(LogEvent(level="INFO", module="audit", message=f"任务 {task_id} 开始执行", task_id=task_id))
+    bus.publish(LogEvent(level="INFO", module="audit",
+                         message=f"任务 {task_id} 开始执行{'（脱机模式）' if offline_mode else ''}",
+                         task_id=task_id))
 
     # 延迟导入，避免 API 冷启动就加载 agents 链路
     from src.core.orchestrator import Orchestrator
+
+    # 脱机模式构造一个占位 LLMConfig（不会被实际调用）
+    if offline_mode and llm_cfg is None:
+        from src.config import LLMConfig
+        llm_cfg = LLMConfig(provider="offline", api_key="", model="offline", type="offline")
 
     ctx = ExecutionContext(
         task_id=task_id,
@@ -88,6 +104,7 @@ def run_task(task_id: str, project_id: Optional[str] = None) -> None:
         project_path=Path(project_path),
         llm_config=llm_cfg,
         opencode_config=opencode_cfg,
+        offline_mode=offline_mode,
     )
 
     try:

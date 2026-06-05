@@ -32,8 +32,7 @@ def report_token_usage(
     """上报 token 用量（总量语义）。返回 True 表示已写入或已覆盖更新。"""
     if not task_id:
         return False
-    if llm_input == 0 and llm_output == 0 and code_agent_input == 0 and code_agent_output == 0:
-        return False
+    # 容忍全零上报（部分 LLM 不返回 usage，但至少记录一次心跳）
 
     with session_scope() as session:
         if source_event_id:
@@ -110,3 +109,24 @@ def sum_task_tokens_map_from_ledger(session: Session, task_ids: Sequence[str]) -
 def sum_task_tokens_from_ledger(session: Session, task_id: str) -> Tuple[int, int, int, int]:
     """单任务聚合（同上）。"""
     return sum_task_tokens_map_from_ledger(session, [task_id]).get(task_id, (0, 0, 0, 0))
+
+
+def sum_task_cache_stats_from_ledger(session: Session, task_id: str) -> Tuple[int, int]:
+    """
+    从 token_ledger 中读取 note 以 'cache_stats:' 开头的行，
+    返回 (总命中数, 总未命中数)。
+    llm_input 列为命中数，llm_output 列为未命中数。
+    多个 Agent（chain_analyzer、chain_confirmer）的数据汇总求和。
+    """
+    from sqlalchemy import func as sa_func
+    row = session.execute(
+        select(
+            sa_func.coalesce(sa_func.sum(TokenLedger.llm_input), 0),
+            sa_func.coalesce(sa_func.sum(TokenLedger.llm_output), 0),
+        )
+        .where(
+            TokenLedger.task_id == task_id,
+            TokenLedger.note.like("cache_stats:%"),
+        )
+    ).one()
+    return int(row[0]), int(row[1])

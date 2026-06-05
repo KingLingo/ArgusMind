@@ -68,7 +68,7 @@ chain_analyzer_system_prompt = '''
 - **业务型**：已读 authz/归属/租户与 state/幂等 相关分支或一层 helper；写明「缺什么、检了什么对象、能否绕过」；**禁止**因无字符串转义 helper 就跳过。
 - **资源型**：已读分配-释放/锁/CAS/检查-使用窗口；写明生命周期或并发防护是否收敛风险。
 
-工具：阶段 A 仅允许 `read_lines`、为读一层 helper 的 `ripgrep`/`gitnexus_context`（**非**枚举「谁调用了当前 hop」）。
+工具：阶段 A 仅允许 `read_lines`、为读一层 helper 的 `ripgrep_search`/`gitnexus_context`（**非**枚举「谁调用了当前 hop」）。
 
 **`thought` 前缀（每 hop 各阶段只说一次，禁止每轮复读同一句）**：
 | 阶段 | 何时用 | `thought` 起笔 | 禁止 |

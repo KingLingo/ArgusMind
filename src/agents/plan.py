@@ -13,6 +13,10 @@ from src.agents.brain import Brain
 from src.agents.prompt.plan import plan_prompt
 from src.core.event_span import start_event_span
 from src.core.task_control import ensure_task_running
+from src.knowledge import LANGUAGE_VULN_MAP, AUDIT_SKILLS
+from src.knowledge.audit_skills import AUDIT_WORKFLOW, QUALITY_STANDARDS
+from src.knowledge.audit_config import AUDIT_PROFILES, AUDIT_SCHEDULING
+from src.knowledge.component_vulns import format_component_vulns_for_prompt
 
 
 class Plan(BaseAgent):
@@ -131,7 +135,57 @@ class Plan(BaseAgent):
     def _build_context(self) -> List[Dict[str, str]]:
         tool_schema = self._brain.tool_registry.get_all_tools_schema()
         system_content = plan_prompt.replace("{tool_registry}", tool_schema)
+
+        # 注入知识库：各语言支持的漏洞类型参考
+        knowledge_hint = self._build_knowledge_hint()
+        if knowledge_hint:
+            system_content += "\n\n" + knowledge_hint
+
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": self._brain.project_info},
         ]
+
+    def _build_knowledge_hint(self) -> str:
+        """基于知识库生成各语言漏洞类型参考提示。"""
+        if not LANGUAGE_VULN_MAP:
+            return ""
+
+        parts = ["# 知识库参考：各语言常见漏洞类型\n"]
+        for lang, vuln_types in LANGUAGE_VULN_MAP.items():
+            lang_display = lang.lstrip(".")
+            types_str = "、".join(vuln_types) if isinstance(vuln_types, (list, tuple)) else str(vuln_types)
+            parts.append(f"- **{lang_display}**：{types_str}")
+
+        # 注入审计技能摘要（仅注入与当前项目语言相关的技能）
+        if AUDIT_SKILLS:
+            parts.append("\n## 审计技能参考")
+            for skill in AUDIT_SKILLS[:8]:  # 限制长度
+                name = skill.get("name", "")
+                desc = skill.get("description", "")
+                priority = skill.get("priority", "")
+                if name:
+                    parts.append(f"- **{name}**（{priority}）：{desc}")
+
+        # 注入审计流程知识（仅三层分工概要，不注入完整检查清单）
+        if AUDIT_WORKFLOW:
+            # 只取三层分工表格部分，不注入完整检查清单
+            workflow_summary = AUDIT_WORKFLOW.split("## LLM审计详细检查清单")[0]
+            parts.append("\n## 审计流程参考")
+            parts.append(workflow_summary.strip())
+
+        # 注入审计配置（仅关键参数，不注入全部配置）
+        if AUDIT_SCHEDULING:
+            parts.append(f"\n## 审计调度参数")
+            parts.append(f"- 批次大小：{AUDIT_SCHEDULING.get('maxFilesPerBatch', 6)} 文件/批")
+            parts.append(f"- 最大并行：{AUDIT_SCHEDULING.get('maxParallelRequests', 5)} 请求")
+            parts.append(f"- 检查点间隔：{AUDIT_SCHEDULING.get('checkpointInterval', 3)} 批次")
+
+        # 注入已知漏洞组件参考（当项目包含 Java/Python/JS 等语言时）
+        project_langs = set(LANGUAGE_VULN_MAP.keys()) if LANGUAGE_VULN_MAP else set()
+        if project_langs:
+            component_hint = format_component_vulns_for_prompt()
+            if component_hint:
+                parts.append(component_hint)
+
+        return "\n".join(parts)

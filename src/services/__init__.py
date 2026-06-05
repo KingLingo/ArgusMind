@@ -12,5 +12,7 @@ from src.services import (  # noqa: F401
     token_service,
 )
 from src.services.plan_service import persist_plan
+from src.services.coverage_tracker import CoverageTracker  # noqa: F401
+from src.services.quick_scan_filter import QuickScanFilter  # noqa: F401
 
-__all__ = ["persist_plan"]
+__all__ = ["persist_plan", "CoverageTracker", "QuickScanFilter"]

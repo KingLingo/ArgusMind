@@ -85,13 +85,7 @@ class EventSpan:
         """将 span 内当前四列总量写入 token_ledger（绑定本 event_id，覆盖同一行）。"""
         if not self.task_id or not self._started or not self.event_id:
             return
-        if (
-            not self._llm_input
-            and not self._llm_output
-            and not self._code_agent_input
-            and not self._code_agent_output
-        ):
-            return
+        # 即使 token 全为 0 也上报一次（部分 LLM 不返回 usage）
         self._bus.publish(
             TokenEvent(
                 task_id=self.task_id,

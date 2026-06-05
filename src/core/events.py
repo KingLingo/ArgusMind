@@ -48,6 +48,7 @@ class EventStart(_EventBase):
     tool_name: str = ""
     reason: str = ""
     status: str = ""
+    result: str = ""
     tool_arguments: Optional[Dict[str, Any]] = None
 
 
@@ -116,6 +117,7 @@ class TaskStatusEvent(_EventBase):
     task_id: str = ""
     status: str = ""  # pending / running / completed / failed / cancelled
     message: str = ""
+    vuln_count: int = 0
 
 
 # 向后兼容（旧代码里可能引用 InternalEvent 等名称）
