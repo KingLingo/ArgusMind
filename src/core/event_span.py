@@ -163,6 +163,20 @@ class EventSpan:
         self.finish(exc_type=exc_type, exc_val=exc_val)
         return False  # 不吞掉异常
 
+    def __del__(self) -> None:
+        """安全网：若 span 已 start 但未 finish，说明存在资源泄漏，记录警告并尝试关闭。"""
+        if self._started and not self._finished:
+            import logging
+            logging.getLogger(__name__).warning(
+                "EventSpan 泄漏：task_id=%s module=%s action_type=%s event_id=%s "
+                "已 start 但未 finish，将在 __del__ 中强制关闭",
+                self.task_id, self.module, self.action_type, self.event_id,
+            )
+            try:
+                self.finish()
+            except Exception:
+                pass
+
 
 def event_span(
     *,

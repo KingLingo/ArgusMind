@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI):
                 TaskModel.status.in_(["running", "paused"])
             ).all()
             if orphaned:
+                orphaned_ids = [t.id for t in orphaned]
                 for t in orphaned:
                     t.status = "failed"
                     t.error = "服务重启，任务被动终止"
@@ -90,6 +91,26 @@ async def lifespan(app: FastAPI):
                     "[lifespan] 已将 %d 个遗留 running/paused 任务标记为 failed，内存标记已清理",
                     len(orphaned),
                 )
+                # 同时清理这些任务下遗留的 running 事件
+                from src.infrastructure.db.models import EventRecord
+                from src.core.enums import ActionType
+                from sqlalchemy import update as sa_update
+                ev_result = session.execute(
+                    sa_update(EventRecord)
+                    .where(
+                        EventRecord.task_id.in_(orphaned_ids),
+                        EventRecord.status == "running",
+                        EventRecord.action_type != ActionType.INFORMATION.value,
+                    )
+                    .values(status="failed", finished_at=datetime.now(timezone.utc))
+                )
+                ev_count = int(ev_result.rowcount or 0)
+                if ev_count:
+                    session.commit()
+                    logger.info(
+                        "[lifespan] 已将 %d 条遗留 running 事件标记为 failed",
+                        ev_count,
+                    )
     except Exception as ex:  # pragma: no cover
         logger.warning("[lifespan] 清理遗留 running 任务失败: %s", ex)
     try:
@@ -99,6 +120,30 @@ async def lifespan(app: FastAPI):
         logger.warning("[lifespan] 工具依赖检查失败: %s", ex)
 
     logger.info("[lifespan] ArgusMind API 启动完成，开始接受请求")
+
+    # 非阻塞后台任务：延迟拉取 OpenCode provider 列表（不阻塞启动）
+    try:
+        import threading
+        def _deferred_opencode_fetch():
+            import time
+            time.sleep(10)  # 等 API 完全就绪
+            try:
+                from src.infrastructure.db.init_db import fetch_opencode_provider_list
+                from src.infrastructure.db import session_scope
+                from src.infrastructure.db.models import ConfigEntry
+                fetched = fetch_opencode_provider_list()
+                with session_scope() as session:
+                    row = session.query(ConfigEntry).filter(
+                        ConfigEntry.name == "code_agent_provider_list"
+                    ).one_or_none()
+                    if row is not None and fetched.get("providers"):
+                        row.value_json = fetched
+                logger.info("[lifespan] 后台 OpenCode provider 列表已更新")
+            except Exception as ex:
+                logger.debug("[lifespan] 后台 OpenCode provider 拉取未完成: %s", ex)
+        threading.Thread(target=_deferred_opencode_fetch, daemon=True).start()
+    except Exception:
+        pass
 
     try:
         yield

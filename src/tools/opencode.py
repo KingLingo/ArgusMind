@@ -495,7 +495,7 @@ async def _run_opencode_session_status_poll(
                     if fp != last_status_fp:
                         if _oes is not None and event_id and fp not in persisted_fps:
                             record = _session_status_to_event_record(session_id, status)
-                            _oes.record_opencode_event(event_id=event_id, **record)
+                            _oes.record_opencode_event_buffered(event_id=event_id, **record)
                             persisted_fps.add(fp)
                         logger.debug(
                             "[opencode status] %s",
@@ -655,7 +655,7 @@ def _start_opencode_sse_step_printer(
                         record = None
                         logger.debug("[opencode SSE] 解析事件失败: %s", ex)
                     if record is not None:
-                        _oes.record_opencode_event(event_id=event_id, **record)
+                        _oes.record_opencode_event_buffered(event_id=event_id, **record)
                         persisted_fps.add(fp)
 
                 # 实时回写 events.code_agent_*_delta，便于前端拿到滚动总额
@@ -737,6 +737,8 @@ def _start_opencode_sse_step_printer(
         t.join(timeout=5.0)
         status_t.join(timeout=5.0)
         idle_t.join(timeout=5.0)
+        if _oes is not None and event_id:
+            _oes.close_buffered_writer(event_id)
 
     return _SseListenerHandle(closer, idle_state)
 
@@ -759,6 +761,47 @@ def _latest_assistant_text_from_messages(client: Opencode, session_id: str) -> s
             if isinstance(tx, str) and tx:
                 chunks.append(tx)
     return "\n".join(chunks).strip()
+
+
+def _fetch_session_token_totals(client: Opencode, session_id: str) -> Optional[tuple[int, int]]:
+    """兜底：从会话消息列表中累计所有 assistant 消息的 token 用量。
+
+    当 SSE step-finish 和 chat 响应均未返回 token 时，遍历会话消息的 info.tokens 字段求和。
+    返回 (input_total, output_total) 或 None（无法获取时）。
+    """
+    try:
+        rows = client.session.messages(id=session_id)
+    except Exception as ex:
+        logger.debug("[opencode token] 查询消息列表失败: %s", ex)
+        return None
+    total_in = 0
+    total_out = 0
+    found = False
+    for item in rows:
+        info = getattr(item, "info", None)
+        if getattr(info, "role", None) != "assistant":
+            continue
+        # 优先从 info.tokens 取
+        tok = getattr(info, "tokens", None) if info is not None else None
+        if tok is not None:
+            inp = getattr(tok, "input", None)
+            out = getattr(tok, "output", None)
+            if inp is not None or out is not None:
+                total_in += int(inp or 0)
+                total_out += int(out or 0)
+                found = True
+                continue
+        # 回退：从 model_extra 取
+        extra = getattr(item, "model_extra", None)
+        if isinstance(extra, dict):
+            t = extra.get("info", {}).get("tokens", {})
+            if t:
+                total_in += int(t.get("input") or 0)
+                total_out += int(t.get("output") or 0)
+                found = True
+    if found:
+        return total_in, total_out
+    return None
 
 
 class OpenCodeTool(BaseTool):
@@ -1033,9 +1076,17 @@ class OpenCodeTool(BaseTool):
                 if sse_tokens.get("count", 0.0) > 0:
                     token_input = sse_tokens.get("input")
                     token_output = sse_tokens.get("output")
-                else:
+                elif response_token_input is not None or response_token_output is not None:
                     token_input = response_token_input
                     token_output = response_token_output
+                else:
+                    # 第三层兜底：从会话消息历史中累计 token
+                    session_totals = _fetch_session_token_totals(self.client, sid)
+                    if session_totals is not None:
+                        token_input, token_output = session_totals
+                    else:
+                        token_input = None
+                        token_output = None
                 result = ToolResult(
                     success=True,
                     data={

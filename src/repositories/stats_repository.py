@@ -1,10 +1,11 @@
 """仪表盘聚合查询"""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from src.core.enums import FindingSeverity, TaskStatus
@@ -12,6 +13,10 @@ from src.infrastructure.db.models import Project, Task, TokenLedger, Vulnerabili
 
 SEVERITY_KEYS = tuple(s.value for s in FindingSeverity) + ("unknown",)
 TASK_STATUS_KEYS = tuple(s.value for s in TaskStatus)
+
+# 简单 TTL 缓存（token_totals 高频调用但数据秒级不敏感）
+_token_totals_cache: dict = {"ts": 0.0, "data": None}
+_TOKEN_TOTALS_TTL = 30  # 秒
 
 
 class ProjectOverviewRow(NamedTuple):
@@ -89,27 +94,28 @@ class StatsRepository:
         ]
 
     def aggregate_language_stats_python(self) -> Dict[str, Dict[str, int]]:
-        """加载全部项目的 language_stats JSONB，在应用层按语言合并。"""
-        rows = self.session.execute(
-            select(Project.language_stats).where(Project.language_stats.isnot(None))
-        ).scalars().all()
+        """使用 PostgreSQL JSONB 聚合函数在 DB 内完成语言统计合并。"""
+        sql = text("""
+            SELECT
+                lang.key AS language,
+                SUM((lang.value->>'code')::int) AS code,
+                SUM((lang.value->>'files')::int) AS files,
+                SUM((lang.value->>'lines')::int) AS lines
+            FROM projects,
+                 jsonb_each(COALESCE(language_stats, '{}'::jsonb)) AS top,
+                 jsonb_each(COALESCE(top.value, '{}'::jsonb)) AS lang
+            WHERE top.key = 'languages'
+            GROUP BY lang.key
+            ORDER BY SUM((lang.value->>'code')::int) DESC
+        """)
+        rows = self.session.execute(sql).all()
         merged: Dict[str, Dict[str, int]] = {}
-        for stats in rows:
-            if not isinstance(stats, dict):
-                continue
-            languages = stats.get("languages")
-            if not isinstance(languages, dict):
-                continue
-            for lang, data in languages.items():
-                if not isinstance(data, dict):
-                    continue
-                bucket = merged.setdefault(
-                    str(lang),
-                    {"code": 0, "files": 0, "lines": 0},
-                )
-                bucket["code"] += int(data.get("code") or 0)
-                bucket["files"] += int(data.get("files") or 0)
-                bucket["lines"] += int(data.get("lines") or 0)
+        for lang, code, files, lines in rows:
+            merged[str(lang)] = {
+                "code": int(code or 0),
+                "files": int(files or 0),
+                "lines": int(lines or 0),
+            }
         return merged
 
     def finding_counts_by_severity(self) -> Tuple[int, Dict[str, int]]:
@@ -158,6 +164,12 @@ class StatsRepository:
         return [(str(r[0]), (r[1] or "unknown").strip().lower() or "unknown", int(r[2])) for r in rows]
 
     def token_totals(self) -> Tuple[int, int, int, int]:
+        global _token_totals_cache
+        now = time.monotonic()
+        if now - _token_totals_cache["ts"] < _TOKEN_TOTALS_TTL:
+            cached = _token_totals_cache["data"]
+            if cached is not None:
+                return cached
         row = self.session.execute(
             select(
                 func.coalesce(func.sum(TokenLedger.llm_input), 0),
@@ -165,8 +177,12 @@ class StatsRepository:
                 func.coalesce(func.sum(TokenLedger.code_agent_input), 0),
                 func.coalesce(func.sum(TokenLedger.code_agent_output), 0),
             )
+            .where(~TokenLedger.note.like("cache_stats:%"))
         ).one()
-        return int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        result = (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        _token_totals_cache["ts"] = now
+        _token_totals_cache["data"] = result
+        return result
 
     def token_daily(
         self,
@@ -181,6 +197,7 @@ class StatsRepository:
                 func.coalesce(func.sum(TokenLedger.code_agent_input), 0),
                 func.coalesce(func.sum(TokenLedger.code_agent_output), 0),
             )
+            .where(~TokenLedger.note.like("cache_stats:%"))
             .group_by(func.date(TokenLedger.created_at))
             .order_by(func.date(TokenLedger.created_at))
         )

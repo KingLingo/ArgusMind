@@ -228,13 +228,31 @@ def create_all_tables(config: Config) -> bool:
 
 
 def _ensure_missing_columns(engine, db_name: str) -> None:
-    """对已有表补建缺失的列（幂等：已存在则跳过）。"""
+    """对已有表补建缺失的列（幂等：已存在则跳过）。
+
+    两条路径：
+    1. 硬编码迁移清单（用于旧表新增列的注释性迁移）
+    2. 自动检测：遍历所有 ORM 注册的表，与数据库实际 schema 对比，补建缺失列
+    """
     import sqlalchemy as sa
 
+    # --- 路径1：硬编码迁移 ---
     migrations = [
         # (table, column, type_def)
         ("tasks", "offline_mode", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ("tasks", "vuln_count", "INTEGER NOT NULL DEFAULT 0"),
+        # vulnerability_details 新增字段
+        ("vulnerability_details", "remediation", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "safe_validation", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "impact", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "owasp", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "gbt_mapping", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "cwe", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "cve", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "code_snippet", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "language", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "cvss_score", "TEXT NOT NULL DEFAULT ''"),
+        ("vulnerability_details", "sink", "JSONB"),
     ]
     with engine.connect() as conn:
         for table, column, type_def in migrations:
@@ -249,6 +267,53 @@ def _ensure_missing_columns(engine, db_name: str) -> None:
                 conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {type_def}"))
                 conn.commit()
                 logger.info("[init_db] 列迁移: %s.%s 已添加", table, column)
+
+    # --- 路径2：自动检测 ORM 模型与数据库差异 ---
+    _auto_sync_orm_columns(engine)
+
+
+def _auto_sync_orm_columns(engine) -> None:
+    """自动将 ORM 模型中定义了但数据库表中缺失的列补建。
+
+    利用 SQLAlchemy metadata 对比 information_schema，自动补列，
+    避免每次新增字段都要手动维护 migrations 列表。
+    """
+    import sqlalchemy as sa
+    from src.infrastructure.db import Base
+
+    inspector = sa.inspect(engine)
+    with engine.connect() as conn:
+        for table_name, table in Base.metadata.tables.items():
+            if table_name.startswith("_") or table_name == "alembic_version":
+                continue
+            try:
+                db_cols = {c["name"] for c in inspector.get_columns(table_name)}
+            except Exception:
+                continue  # 表不存在时跳过
+            for column in table.columns:
+                if column.key not in db_cols:
+                    # 构造列 DDL
+                    col_type = column.type.compile(engine.dialect)
+                    nullable = "NULL" if column.nullable else "NOT NULL"
+                    default = ""
+                    if column.default is not None and column.default.arg is not None:
+                        default_val = column.default.arg
+                        if callable(default_val):
+                            default_val = default_val()
+                        if isinstance(default_val, str):
+                            default = f"DEFAULT '{default_val}'"
+                        elif isinstance(default_val, (int, float, bool)):
+                            default = f"DEFAULT {default_val}"
+                        else:
+                            default = f"DEFAULT '{default_val}'"
+                    ddl = f"ALTER TABLE {table_name} ADD COLUMN {column.key} {col_type} {nullable} {default}"
+                    try:
+                        conn.execute(sa.text(ddl))
+                        conn.commit()
+                        logger.info("[init_db] 自动补列: %s.%s (%s)", table_name, column.key, col_type)
+                    except Exception as ex:
+                        conn.rollback()
+                        logger.warning("[init_db] 自动补列失败 %s.%s: %s", table_name, column.key, ex)
 
 
 def _ensure_fk_constraints(engine) -> None:
@@ -281,10 +346,37 @@ def _ensure_fk_constraints(engine) -> None:
 
 
 def ensure_database_exists(config: Config) -> bool:
-    """若目标数据库不存在则自动创建，返回是否新建了数据库。"""
+    """若目标数据库不存在则自动创建，返回是否新建了数据库。
+
+    支持以下场景：
+    - PostgreSQL 有 `postgres` 维护库（标准安装）
+    - `template1` 维护库（部分托管服务缺少 postgres 库）
+    - 数据库已存在：幂等返回 False
+    """
     pg = config.postgres
     target_db = pg.db
 
+    # 先尝试直接连接到目标库校验是否存在
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=pg.host,
+            port=pg.port,
+            user=pg.user,
+            password=pg.password,
+            dbname=target_db,
+            connect_timeout=3,
+        )
+        conn.close()
+        logger.info("[init_db] 目标数据库已存在: db=%s", target_db)
+        return False
+    except (psycopg2.OperationalError, psycopg2.ProgrammingError):
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # 通过维护库创建目标库
     for maintenance_db in ("postgres", "template1"):
         conn = None
         try:
@@ -294,6 +386,7 @@ def ensure_database_exists(config: Config) -> bool:
                 user=pg.user,
                 password=pg.password,
                 dbname=maintenance_db,
+                connect_timeout=3,
             )
             conn.autocommit = True
             with conn.cursor() as cur:
@@ -316,10 +409,15 @@ def ensure_database_exists(config: Config) -> bool:
                 ex,
             )
             if maintenance_db == "template1":
+                logger.warning("[init_db] 所有维护库连接失败，数据库可能未启动: host=%s port=%s", pg.host, pg.port)
                 raise
         finally:
             if conn is not None:
                 conn.close()
+    # 如果所有尝试都失败（理论上不会走到这里，但防御性保留）
+    raise RuntimeError(
+        f"无法创建数据库 '{target_db}'：无法连接到 PostgreSQL (host={pg.host}:{pg.port})"
+    )
 
 
 def set_llm_provider(session: Session) -> None:
@@ -329,11 +427,16 @@ def set_llm_provider(session: Session) -> None:
         name="LLM_provider_list",
         fetcher=fetch_litellm_provider_list,
     )
-    _hydrate_provider_list(
-        session,
-        name="code_agent_provider_list",
-        fetcher=fetch_opencode_provider_list,
-    )
+    # OpenCode provider list 在启动时单独异步拉取，不阻塞 init_db
+    # 首次初始化时仅写入占位空数据
+    placeholder = {"providers": [], "note": "将在后台任务中更新"}
+    row = session.query(ConfigEntry).filter(ConfigEntry.name == "code_agent_provider_list").one_or_none()
+    if row is None:
+        row = ConfigEntry(name="code_agent_provider_list", value_json=placeholder,
+                          description="内置 Code Agent 厂商/模型清单")
+        session.add(row)
+    elif not row.value_json or not isinstance(row.value_json, dict) or not row.value_json.get("providers"):
+        row.value_json = placeholder
 
 
 def seed_default_data(session: Session) -> None:
@@ -365,12 +468,63 @@ def seed_default_data(session: Session) -> None:
             session.add(row)
             created_config_count += 1
 
+    # 确保 token_ledger 自动清理事件监听器相关配置存在
+    for name in ("token_ledger_cleanup_enabled",):
+        row = session.query(ConfigEntry).filter(ConfigEntry.name == name).one_or_none()
+        if row is None:
+            row = ConfigEntry(name=name, value_json={"enabled": True},
+                              description="Token ledger 自动清理启用标志")
+            session.add(row)
+
     session.flush()
     logger.info(
         "[init_db] 默认配置写入完成: created=%d total=%d",
         created_config_count,
         len(DEFAULT_CONFIGS),
     )
+
+
+def _validate_init(session: Session) -> List[str]:
+    """初始化完成后校验关键条件，返回缺失/异常列表。"""
+    issues: List[str] = []
+
+    # 1. 校验表是否存在
+    import sqlalchemy as sa
+    engine = session.bind
+    required_tables = {
+        "users", "configs", "projects", "tasks", "events", "event_details",
+        "token_ledger", "vulnerability", "vulnerability_details", "logs",
+        "human_interactions", "opencode_events",
+    }
+    existing = set(sa.inspect(engine).get_table_names())
+    missing_tables = required_tables - existing
+    if missing_tables:
+        issues.append(f"缺失表: {', '.join(sorted(missing_tables))}")
+
+    # 2. 校验种子用户是否存在
+    user = session.query(User).filter(User.username == DEFAULT_USERNAME).one_or_none()
+    if user is None:
+        issues.append(f"默认用户 '{DEFAULT_USERNAME}' 未创建")
+
+    # 3. 校验关键配置项是否存在
+    required_configs = {"LLM_config", "code_agent_config"}
+    existing_configs = set(
+        row[0] for row in session.query(ConfigEntry.name).filter(
+            ConfigEntry.name.in_(required_configs)
+        ).all()
+    )
+    missing_configs = required_configs - existing_configs
+    if missing_configs:
+        issues.append(f"缺失配置项: {', '.join(sorted(missing_configs))}")
+
+    # 4. 校验每个表至少有一列（表结构完整性）
+    for table in required_tables:
+        if table in existing:
+            cols = [c["name"] for c in sa.inspect(engine).get_columns(table)]
+            if not cols:
+                issues.append(f"表 '{table}' 无有效列")
+
+    return issues
 
 
 
@@ -417,5 +571,39 @@ def init_db(config: Config) -> None:
         seed_default_data(session)
         logger.info("[init_db] 开始刷新 provider 清单")
         set_llm_provider(session)
+        logger.info("[init_db] 执行初始化校验…")
+        issues = _validate_init(session)
+        if issues:
+            logger.warning("[init_db] 初始化校验发现 %d 个问题: %s", len(issues), "; ".join(issues))
+        else:
+            logger.info("[init_db] 初始化校验通过")
+    _ensure_perf_indexes(config)
     init_neo4j_indexes(config)
     logger.info("[init_db] 初始化完成")
+
+
+def _ensure_perf_indexes(config: Config) -> None:
+    """创建性能相关索引（幂等）。"""
+    import sqlalchemy as sa
+    engine = init_engine(config.postgres)
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_token_ledger_note ON token_ledger (note)",
+        "CREATE INDEX IF NOT EXISTS idx_token_ledger_created_at ON token_ledger (created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_token_ledger_task_id ON token_ledger (task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_events_task_id_status ON events (task_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_opencode_events_event_id ON opencode_events (event_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vulnerability_task_id ON vulnerability (task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vulnerability_project_id ON vulnerability (project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_vulnerability_category_name ON vulnerability (category_name)",
+        "CREATE INDEX IF NOT EXISTS idx_logs_task_id ON logs (task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_human_interactions_task_id ON human_interactions (task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_human_interactions_event_id ON human_interactions (event_id)",
+    ]
+    with engine.connect() as conn:
+        for ddl in indexes:
+            try:
+                conn.execute(sa.text(ddl))
+                conn.commit()
+            except Exception as ex:
+                logger.warning("[init_db] 索引创建失败: %s — %s", ddl, ex)
+    logger.info("[init_db] 性能索引检查完成")

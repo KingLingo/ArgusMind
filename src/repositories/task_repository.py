@@ -91,6 +91,7 @@ class TaskRepository:
                 func.count().label("vuln_count"),
             )
             .where(Vulnerability.task_id.isnot(None))
+            .where(Vulnerability.status != "false_positive")
             .group_by(Vulnerability.task_id)
         ).subquery()
 
@@ -102,6 +103,7 @@ class TaskRepository:
                 func.coalesce(func.sum(TokenLedger.code_agent_input), 0).label("agg_ca_in"),
                 func.coalesce(func.sum(TokenLedger.code_agent_output), 0).label("agg_ca_out"),
             )
+            .where(~TokenLedger.note.like("cache_stats:%"))
             .group_by(TokenLedger.task_id)
         ).subquery()
 

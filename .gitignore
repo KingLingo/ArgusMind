@@ -26,6 +26,7 @@ venv/
 ENV/
 env/
 .venv
+.claude/
 
 # IDE
 .vscode/
@@ -48,9 +49,18 @@ logs/
 # Testing
 .pytest_cache/
 .coverage
+
+# Temporary debug/test scripts
+_debug_*
+_query_*
+_check_*
+_verify_*
+
+# Scripts (debug/migration one-off scripts)
+scripts/
 htmlcov/
 .tox/
-
+CLAUDE.md
 # Binaries (do not commit large executables)
 *.exe
 src/tools/bin/

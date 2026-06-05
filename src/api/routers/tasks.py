@@ -35,27 +35,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[CurrentUserDep])
 
 
-def _inject_token_usage(task: Any) -> TaskRead:
-    """将 token_ledger 聚合结果注入 TaskRead 响应。"""
+def _inject_token_usage(task: Any, session=None) -> TaskRead:
+    """将 token_ledger 聚合结果注入 TaskRead 响应。可复用外部 session 避免 N+1。"""
     data = TaskRead.model_validate(task)
     try:
-        from src.infrastructure.db import session_scope
-        from src.services.token_service import (
-            sum_task_cache_stats_from_ledger,
-            sum_task_tokens_from_ledger,
-        )
-        with session_scope() as session:
-            li, lo, ci, co = sum_task_tokens_from_ledger(session, task.id)
-            ch, cm = sum_task_cache_stats_from_ledger(session, task.id)
-        data.llm_input_token = li
-        data.llm_output_token = lo
-        data.code_agent_input_token = ci
-        data.code_agent_output_token = co
-        data.cache_hits = ch
-        data.cache_misses = cm
+        if session is None:
+            from src.infrastructure.db import session_scope
+            with session_scope() as s:
+                _fill_token_usage(s, task, data)
+        else:
+            _fill_token_usage(session, task, data)
     except Exception:
         pass
     return data
+
+
+def _fill_token_usage(session, task, data: TaskRead) -> None:
+    from src.services.token_service import (
+        sum_task_cache_stats_from_ledger,
+        sum_task_tokens_from_ledger,
+    )
+    li, lo, ci, co = sum_task_tokens_from_ledger(session, task.id)
+    ch, cm = sum_task_cache_stats_from_ledger(session, task.id)
+    data.llm_input_token = li
+    data.llm_output_token = lo
+    data.code_agent_input_token = ci
+    data.code_agent_output_token = co
+    data.cache_hits = ch
+    data.cache_misses = cm
 
 
 @router.get(
@@ -92,10 +99,14 @@ def list_tasks(
 
 @router.get("/detail", response_model=OkResponse[TaskRead])
 def get_task_detail(id: UUID = Query(..., alias="id")) -> OkResponse[TaskRead]:
-    task = task_service.get_task(str(id))
-    if task is None:
-        raise NotFoundError("任务不存在")
-    data = _inject_token_usage(task)
+    from src.infrastructure.db import session_scope
+    from src.repositories.task_repository import TaskRepository
+
+    with session_scope() as session:
+        task = TaskRepository(session).get(str(id))
+        if task is None:
+            raise NotFoundError("任务不存在")
+        data = _inject_token_usage(task, session=session)
     return OkResponse[TaskRead](data=data)
 
 

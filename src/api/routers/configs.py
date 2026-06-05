@@ -132,6 +132,11 @@ async def update_code_agent(body: CodeAgentConfigUpdate) -> OkResponse[dict]:
 @router.get("/code-agent", response_model=OkResponse[dict])
 def get_code_agent_config() -> OkResponse[dict]:
     config = config_service.get_value_json(config_service.CFG_CODE_AGENT) or {}
+    # DB 配置为空时，尝试从本地 opencode 服务自动探测
+    if not config.get("code_agent_provider") or not config.get("code_agent_model"):
+        detected = config_service.fetch_opencode_runtime_config_from_service()
+        if detected:
+            config = {**config, **detected, "_source": "local_opencode_service"}
     return OkResponse[dict](data=_sanitize_code_agent_config(config))
 
 

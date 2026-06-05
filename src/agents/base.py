@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class BaseAgent:
     """所有需要 LLM 多轮对话 + 工具调用的 Agent 的公共基类。"""
 
-    _TOOL_CACHE_MAXSIZE = 128
+    _TOOL_CACHE_MAXSIZE = 1024
 
     def __init__(self, brain: Optional[Brain] = None, max_retries: int = 3):
         self._brain = brain
@@ -46,7 +46,7 @@ class BaseAgent:
         module = getattr(self, "MODULE_NAME", None) or self._agent_tag
         task_id = getattr(self._brain, "task_id", None) if self._brain else None
         try:
-            get_event_bus().publish(
+            get_event_bus().publish_async(
                 LogEvent(level=level, module=module, message=message, task_id=task_id)
             )
         except Exception as ex:

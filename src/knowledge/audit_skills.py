@@ -32,7 +32,6 @@ AUDIT_WORKFLOW = """
 - 每个接口方法是否验证用户输入？
 - 是否有权限检查（@PreAuthorize、SecurityContextHolder）？
 - 是否有CSRF Token验证？
-- 是否有速率限制？
 - 重定向目标是否白名单验证？
 - 文件操作是否路径遍历防护？
 - SQL查询是否参数化？

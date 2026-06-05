@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import string
 from pathlib import Path
@@ -16,6 +17,8 @@ from src.infrastructure.db import session_scope
 from src.infrastructure.db.models import ConfigEntry
 from src.schemas.config import CodeAgentConfigUpdate
 from src.tmp_dir import tmp_base_glob
+
+logger = logging.getLogger(__name__)
 
 CFG_LLM = "LLM_config"
 CFG_CODE_AGENT = "code_agent_config"
@@ -265,6 +268,67 @@ def _is_custom_code_agent_model(cfg: Dict[str, Any]) -> bool:
                 return False
         return True
     return True
+
+
+def fetch_opencode_runtime_config_from_service() -> Dict[str, Any]:
+    """从本地运行的 opencode 服务读取当前配置，自动探测 provider/model/baseurl。
+
+    返回与 DB code_agent_config 同结构的字典，仅含能探测到的字段。
+    若 opencode 服务未启动或读取失败，返回空字典。
+    """
+    from src.tools.opencode import OpenCodeTool
+    tool: OpenCodeTool | None = None
+    try:
+        project_root = _project_root()
+        tool = OpenCodeTool(
+            project_path=project_root,
+            model_id="",
+            provider_id="",
+        )
+        service_url = tool.get_url().rstrip("/")
+        result: Dict[str, Any] = {}
+
+        with httpx.Client(timeout=5.0) as client:
+            # 读取 global config 获取 provider 和 model
+            config_resp = client.get(f"{service_url}/global/config")
+            if config_resp.status_code == 200:
+                config_data = config_resp.json()
+                model_str = (config_data.get("model") or "").strip()
+                if model_str and "/" in model_str:
+                    parts = model_str.split("/", 1)
+                    result["code_agent_provider"] = parts[0]
+                    result["code_agent_model"] = parts[1]
+
+                # 从 provider 配置中提取 baseURL
+                provider_id = result.get("code_agent_provider", "")
+                if provider_id:
+                    providers = config_data.get("provider") or {}
+                    provider_cfg = providers.get(provider_id) or {}
+                    options = provider_cfg.get("options") or {}
+                    base_url = options.get("baseURL") or ""
+                    if base_url:
+                        result["code_agent_baseurl"] = base_url
+
+            # 读取 auth 获取 API Key
+            provider_id = result.get("code_agent_provider", "")
+            if provider_id:
+                auth_resp = client.get(f"{service_url}/auth/{provider_id}")
+                if auth_resp.status_code == 200:
+                    auth_data = auth_resp.json()
+                    key = (auth_data.get("key") or "").strip()
+                    if key:
+                        result["code_agent_key"] = key
+
+        return result
+    except Exception as ex:
+        logger.debug("[config_service] 从本地 opencode 读取配置失败: %s", ex)
+        return {}
+    finally:
+        if tool is not None:
+            try:
+                tool.close()
+            except Exception:
+                pass
 
 
 async def _save_code_agent_config_to_opencode(cfg: Dict[str, Any]) -> None:

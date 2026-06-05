@@ -343,6 +343,7 @@ class QuickScanFilter:
         self._confidence_threshold = confidence_threshold
         self._file_cache: Dict[str, List[str]] = {}
         self._hint_score_cache: Dict[str, int] = {}  # 文件路径 → 安全线索加分缓存
+        self._filtered_items: List[Dict[str, Any]] = []  # 追踪被过滤的发现
         self._stats = {
             "total": 0, "passed": 0, "filtered": 0,
             "must_pass": 0, "guard_mitigated": 0, "test_deprioritized": 0,
@@ -354,9 +355,14 @@ class QuickScanFilter:
             "must_pass": 0, "guard_mitigated": 0, "test_deprioritized": 0,
         }
         self._hint_score_cache.clear()
+        self._filtered_items.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         return dict(self._stats)
+
+    def get_filtered(self) -> List[Dict[str, Any]]:
+        """返回本次过滤中被移除的原始发现列表。"""
+        return list(self._filtered_items)
 
     def filter(
         self,
@@ -376,6 +382,8 @@ class QuickScanFilter:
 
             if processed is None:
                 self._stats["filtered"] += 1
+                finding["_filter_reason"] = "process_finding_rejected"
+                self._filtered_items.append(finding)
                 continue
 
             # 候选评分检查
@@ -390,6 +398,8 @@ class QuickScanFilter:
                 result.append(processed)
             else:
                 self._stats["filtered"] += 1
+                processed["_filter_reason"] = f"low_score:{score}<{self._candidate_threshold}"
+                self._filtered_items.append(processed)
 
         return result
 

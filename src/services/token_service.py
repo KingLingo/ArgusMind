@@ -84,7 +84,7 @@ def report_token_usage(
 
 
 def sum_task_tokens_map_from_ledger(session: Session, task_ids: Sequence[str]) -> Dict[str, Tuple[int, int, int, int]]:
-    """按 task_id 对 token_ledger 四列求和（有 source_event_id 的行为该 event 总量快照，无键行为独立片段行）。"""
+    """按 task_id 对 token_ledger 四列求和（排除 cache_stats 行，因其 llm_input/llm_output 存的是缓存命中/未命中数而非 token 用量）。"""
     ids = [tid for tid in task_ids if tid]
     if not ids:
         return {}
@@ -96,7 +96,10 @@ def sum_task_tokens_map_from_ledger(session: Session, task_ids: Sequence[str]) -
             func.coalesce(func.sum(TokenLedger.code_agent_input), 0),
             func.coalesce(func.sum(TokenLedger.code_agent_output), 0),
         )
-        .where(TokenLedger.task_id.in_(ids))
+        .where(
+            TokenLedger.task_id.in_(ids),
+            ~TokenLedger.note.like("cache_stats:%"),
+        )
         .group_by(TokenLedger.task_id)
     )
     out: Dict[str, Tuple[int, int, int, int]] = {tid: (0, 0, 0, 0) for tid in ids}
@@ -116,17 +119,28 @@ def sum_task_cache_stats_from_ledger(session: Session, task_id: str) -> Tuple[in
     从 token_ledger 中读取 note 以 'cache_stats:' 开头的行，
     返回 (总命中数, 总未命中数)。
     llm_input 列为命中数，llm_output 列为未命中数。
-    多个 Agent（chain_analyzer、chain_confirmer）的数据汇总求和。
+
+    每个 Agent（如 chain_analyzer、chain_confirmer）多次上报的是递增累计值，
+    因此按 note 分组取 MAX 得到各 Agent 最终值，再求和。
     """
     from sqlalchemy import func as sa_func
-    row = session.execute(
+    # 子查询：按 note 分组取各 Agent 的最大值（即最新累计值）
+    per_agent = (
         select(
-            sa_func.coalesce(sa_func.sum(TokenLedger.llm_input), 0),
-            sa_func.coalesce(sa_func.sum(TokenLedger.llm_output), 0),
+            sa_func.coalesce(sa_func.max(TokenLedger.llm_input), 0).label("max_hits"),
+            sa_func.coalesce(sa_func.max(TokenLedger.llm_output), 0).label("max_misses"),
         )
         .where(
             TokenLedger.task_id == task_id,
             TokenLedger.note.like("cache_stats:%"),
+        )
+        .group_by(TokenLedger.note)
+    ).subquery()
+    # 外层：对所有 Agent 的最终值求和
+    row = session.execute(
+        select(
+            sa_func.coalesce(sa_func.sum(per_agent.c.max_hits), 0),
+            sa_func.coalesce(sa_func.sum(per_agent.c.max_misses), 0),
         )
     ).one()
     return int(row[0]), int(row[1])

@@ -83,7 +83,7 @@ class Orchestrator:
 
     # ---------- 日志辅助 ----------
     def _log(self, task_id: str, level: str, message: str) -> None:
-        self._bus.publish(
+        self._bus.publish_async(
             LogEvent(level=level, module=self.MODULE_NAME, message=message, task_id=task_id)
         )
 
@@ -683,23 +683,46 @@ class Orchestrator:
 
                 if ctx.offline_mode:
                     # 脱机模式：无 LLM，仅靠规则过滤
-                    # LLMOptimizer + QuickScanFilter 组合过滤
                     if quick_scan_findings:
                         try:
+                            # 步骤1: 全部原始结果先入库
+                            raw_findings = list(quick_scan_findings)
+                            from src.services.vulnerability_service import persist_quick_scan_findings
+                            qs_persisted = persist_quick_scan_findings(
+                                ctx.project_id, ctx.task_id, raw_findings
+                            )
+                            self._log(ctx.task_id, "INFO",
+                                      f"快速扫描发现 {qs_persisted} 条已全部入库 (含待过滤项)")
+
+                            # 步骤2: 规则过滤
                             qs_filter = QuickScanFilter(
                                 project_root=str(ctx.project_path),
                                 candidate_threshold=5,
                                 confidence_threshold=0.3,
                             )
-                            quick_scan_findings = qs_filter.filter(quick_scan_findings)
+                            quick_scan_findings = qs_filter.filter(raw_findings)
                             filter_stats = qs_filter.get_stats()
                             self._log(ctx.task_id, "INFO",
                                       f"QuickScanFilter (脱机): "
                                       f"输入={filter_stats['total']} → "
                                       f"通过={filter_stats['passed']} "
                                       f"过滤={filter_stats['filtered']}")
+
+                            # 步骤3: 标记被过滤的记录
+                            filtered = qs_filter.get_filtered()
+                            if filtered:
+                                from src.services.vulnerability_service import update_quick_scan_filtered_findings
+                                marked = update_quick_scan_filtered_findings(ctx.task_id, filtered)
+                                self._log(ctx.task_id, "INFO",
+                                          f"已将 {marked} 条被过滤的发现标记为 false_positive")
                         except Exception as e:
                             self._log(ctx.task_id, "WARNING", f"QuickScanFilter 过滤失败（使用原始结果）: {e}")
+                            # 降级：尝试入库原始结果
+                            try:
+                                from src.services.vulnerability_service import persist_quick_scan_findings
+                                persist_quick_scan_findings(ctx.project_id, ctx.task_id, quick_scan_findings)
+                            except Exception:
+                                pass
                 else:
                     # 联机模式：LLM 验证替代规则过滤
                     # LLM 验证对过滤前的完整结果做判断，避免规则过滤误伤真实漏洞
@@ -762,13 +785,13 @@ class Orchestrator:
                         except Exception as e:
                             self._log(ctx.task_id, "WARNING", f"LLM 验证快速扫描失败（使用原始结果）: {e}")
 
+                # 脱机模式：已经在上方完成了全部入库+过滤标记
                 # 联机模式：将过滤前的完整结果注入 shared_brain 供 SinkFinder 参考
-                # 脱机模式无 LLM agent 消费此字段，无需赋值
                 if not ctx.offline_mode:
                     shared_brain.quick_scan_findings = quick_scan_findings_raw if quick_scan_findings_raw else quick_scan_findings
 
-                # 快速扫描结果立即入库
-                if quick_scan_findings:
+                # 快速扫描结果立即入库（脱机模式已在规则过滤步骤中入库，跳过避免重复）
+                if quick_scan_findings and not ctx.offline_mode:
                     try:
                         from src.services.vulnerability_service import persist_quick_scan_findings
                         qs_persisted = persist_quick_scan_findings(
@@ -778,12 +801,11 @@ class Orchestrator:
                                   f"快速扫描发现 {qs_persisted} 条已实时入库")
 
                         # 联机模式：更新已入库记录的 LLM 验证状态
-                        if not ctx.offline_mode:
-                            try:
-                                from src.services.vulnerability_service import update_quick_scan_verification
-                                update_quick_scan_verification(ctx.task_id, quick_scan_findings)
-                            except Exception as e:
-                                self._log(ctx.task_id, "WARNING", f"更新快速扫描验证状态失败: {e}")
+                        try:
+                            from src.services.vulnerability_service import update_quick_scan_verification
+                            update_quick_scan_verification(ctx.task_id, quick_scan_findings)
+                        except Exception as e:
+                            self._log(ctx.task_id, "WARNING", f"更新快速扫描验证状态失败: {e}")
                     except Exception as e:
                         self._log(ctx.task_id, "WARNING", f"快速扫描入库失败: {e}")
 
@@ -888,25 +910,39 @@ class Orchestrator:
                     return None
 
             def _collect_and_dedup_findings():
-                """从 Neo4j 收集 findings + 合并快速扫描 + 去重 + 验证"""
+                """从 PostgreSQL 收集 findings（与 API 报告数据源一致）+ 去重 + 验证"""
                 nonlocal all_findings_for_report
                 findings = []
                 try:
-                    neo4j_client = db_manager.neo4j_client
-                    if neo4j_client:
-                        result_records = neo4j_client.execute_read(
-                            "MATCH (ar:AnalysisResult {task_id: $task_id, status: 'completed'}) "
-                            "RETURN ar.verdict AS verdict, ar.severity AS severity, ar.vuln_type AS vuln_type "
-                            "LIMIT 200",
-                            parameters={"task_id": ctx.task_id},
-                        )
-                        for rec in result_records:
-                            findings.append(dict(rec))
+                    from src.infrastructure.db import session_scope
+                    from src.infrastructure.db.models import Vulnerability
+                    with session_scope() as _s:
+                        rows = _s.query(Vulnerability).filter(
+                            Vulnerability.task_id == ctx.task_id,
+                            Vulnerability.status != "false_positive",
+                        ).all()
+                        for row in rows:
+                            findings.append({
+                                "id": row.id,
+                                "project_id": row.project_id,
+                                "task_id": row.task_id,
+                                "vul_name": row.vul_name,
+                                "vuln_type": row.category_name,
+                                "category_name": row.category_name,
+                                "verdict": row.verdict,
+                                "severity": row.level,
+                                "level": row.level,
+                                "confidence": row.confidence,
+                                "source": row.source or "quick_scan",
+                                "neo4j_element_id": row.neo4j_element_id,
+                                "status": row.status,
+                                "verification_status": row.verification_status,
+                            })
                 except Exception as e:
-                    self._log(ctx.task_id, "WARNING", f"Neo4j 查询 findings 失败: {e}")
+                    self._log(ctx.task_id, "WARNING", f"PostgreSQL 查询 findings 失败，降级使用内存数据: {e}")
 
-                # 合并快速扫描结果
-                merged = quick_scan_findings + findings
+                # PostgreSQL 查询成功则直接使用；降级时仍用快扫内存数据
+                merged = findings if findings else quick_scan_findings
 
                 # 跨源去重（脱机模式跳过 LLM 去重，仅做简单合并）
                 if merged:
@@ -953,7 +989,7 @@ class Orchestrator:
                 all_findings_for_report = findings_future.result()
 
             # Quick Scan 发现已在 _run_quick_scan_pipeline 结束时实时入库
-            # all_findings_for_report 包含快扫 + Neo4j 混合数据，仅用于评分和报告
+            # all_findings_for_report 直接读取 PostgreSQL（与 report API 同源），不再查 Neo4j
 
             # 4.5) AST 增强分析：对 findings 进行上下文感知的深度分析（置信度提升 + 证据丰富化）
             if all_findings_for_report:
@@ -984,10 +1020,9 @@ class Orchestrator:
                 except Exception as e:
                     self._log(ctx.task_id, "WARNING", f"AST 增强分析失败（不阻断主流程）: {e}")
 
-            # 5) 审计评分、利用链分析、覆盖率报告 三者互不依赖，并行执行
+            # 5) 审计评分、覆盖率报告 互不依赖，并行执行
             audit_score_result = None
             coverage_report = None
-            exploit_chain_report = None
 
             def _calc_audit_score():
                 """计算审计评分"""
@@ -1011,25 +1046,6 @@ class Orchestrator:
                     ))
                 except Exception as e:
                     self._log(ctx.task_id, "WARNING", f"生成审计评分报告失败: {e}")
-
-            def _calc_exploit_chain():
-                """利用链分析"""
-                nonlocal exploit_chain_report
-                if not all_findings_for_report or len(all_findings_for_report) < 2:
-                    return
-                try:
-                    from src.analyzers.exploit_chain import generate_exploit_chain_report
-                    exploit_chain_report = generate_exploit_chain_report(all_findings_for_report)
-                    chain_count = exploit_chain_report.get("total_chains", 0)
-                    if chain_count > 0:
-                        max_risk = exploit_chain_report.get("summary", {}).get("max_risk_score", 0)
-                        self._log(ctx.task_id, "INFO",
-                                  f"利用链分析: 发现 {chain_count} 条利用链，"
-                                  f"最高风险评分={max_risk}")
-                    else:
-                        self._log(ctx.task_id, "INFO", "利用链分析: 未发现可组合利用的漏洞链")
-                except Exception as e:
-                    self._log(ctx.task_id, "WARNING", f"利用链分析失败: {e}")
 
             def _calc_coverage_report():
                 """生成覆盖率报告"""
@@ -1056,12 +1072,10 @@ class Orchestrator:
                 except Exception as e:
                     self._log(ctx.task_id, "WARNING", f"生成覆盖率报告失败: {e}")
 
-            with ThreadPoolExecutor(max_workers=3) as report_executor:
+            with ThreadPoolExecutor(max_workers=2) as report_executor:
                 score_future = report_executor.submit(_calc_audit_score)
-                chain_future = report_executor.submit(_calc_exploit_chain)
                 coverage_future = report_executor.submit(_calc_coverage_report)
                 score_future.result()
-                chain_future.result()
                 coverage_future.result()
 
             # 6) 防漏报兜底：依赖覆盖率报告和 findings
@@ -1108,7 +1122,7 @@ class Orchestrator:
                     scan_stats=scan_stats,
                     quick_scan_findings=quick_scan_findings,
                     llm_findings=[f for f in all_findings_for_report if f.get("source") not in ("quick_scan", "component_scan")],
-                    exploit_chain_report=exploit_chain_report,
+                    exploit_chain_report=None,
                 )
                 self._log(ctx.task_id, "INFO",
                           f"HTML 审计报告已生成: {report_info.get('file_path', '')}")

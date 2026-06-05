@@ -1238,6 +1238,7 @@ def persist_analysis_result(
             confidence=props["confidence"],
             neo4j_element_id=str(created_node.get("elementId") or ""),
             category_name=category_name,
+            source="chain_analysis",
             detail={
                 "detail": resolution.get("detail", ""),
                 "entry_points": json.dumps(entry_points, ensure_ascii=False),

@@ -1,8 +1,9 @@
 """仪表盘统计服务"""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from src.infrastructure.db import session_scope
 from src.repositories.stats_repository import SEVERITY_KEYS, StatsRepository
@@ -17,6 +18,28 @@ from src.schemas.stats import (
     TaskStats,
     TokenStats,
 )
+
+
+# 简单 TTL 缓存（仪表盘数据秒级不敏感）
+_cache: dict = {"ts": 0.0, "data": {}}
+_CACHE_TTL = 30  # 秒
+
+
+def _cached(key: str, ttl: int = _CACHE_TTL) -> Optional[object]:
+    """获取缓存值，过期返回 None。"""
+    now = time.monotonic()
+    if now - _cache["ts"] < ttl:
+        return _cache["data"].get(key)
+    return None
+
+
+def _set_cache(key: str, value: object) -> None:
+    """设置缓存值。"""
+    now = time.monotonic()
+    if now - _cache["ts"] >= _CACHE_TTL:
+        _cache["data"].clear()
+        _cache["ts"] = now
+    _cache["data"][key] = value
 
 
 def _since_from_days(days: int) -> datetime:
@@ -41,12 +64,20 @@ def _pivot_daily_severity(
 
 
 def get_task_stats() -> TaskStats:
+    cached = _cached("get_task_stats")
+    if cached:
+        return cached  # type: ignore[return-value]
     with session_scope() as session:
         total, by_status = StatsRepository(session).task_counts_by_status()
-        return TaskStats(total=total, by_status=by_status)
+        result = TaskStats(total=total, by_status=by_status)
+        _set_cache("get_task_stats", result)
+        return result
 
 
 def get_project_overview() -> ProjectOverviewStats:
+    cached = _cached("get_project_overview")
+    if cached:
+        return cached  # type: ignore[return-value]
     with session_scope() as session:
         repo = StatsRepository(session)
         overview = repo.project_overview_scalars()
@@ -61,7 +92,7 @@ def get_project_overview() -> ProjectOverviewStats:
             )
             for lang, v in sorted(merged.items(), key=lambda x: (-x[1]["code"], x[0]))
         ]
-        return ProjectOverviewStats(
+        result = ProjectOverviewStats(
             total_projects=overview.total_projects,
             total_files=overview.total_files,
             total_lines=overview.total_lines,
@@ -75,12 +106,19 @@ def get_project_overview() -> ProjectOverviewStats:
                 for r in top
             ],
         )
+        _set_cache("get_project_overview", result)
+        return result
 
 
 def get_finding_stats() -> FindingStats:
+    cached = _cached("get_finding_stats")
+    if cached:
+        return cached  # type: ignore[return-value]
     with session_scope() as session:
         total, by_severity = StatsRepository(session).finding_counts_by_severity()
-        return FindingStats(total=total, by_severity=by_severity)
+        result = FindingStats(total=total, by_severity=by_severity)
+        _set_cache("get_finding_stats", result)
+        return result
 
 
 def list_finding_type_stats(*, limit: int = 50) -> List[FindingTypeStat]:
@@ -97,15 +135,20 @@ def list_finding_daily_stats(*, days: int = 30) -> List[DailySeverityStat]:
 
 
 def get_token_stats() -> TokenStats:
+    cached = _cached("get_token_stats")
+    if cached:
+        return cached  # type: ignore[return-value]
     with session_scope() as session:
         li, lo, ci, co = StatsRepository(session).token_totals()
-        return TokenStats(
+        result = TokenStats(
             llm_input=li,
             llm_output=lo,
             code_agent_input=ci,
             code_agent_output=co,
             total=li + lo + ci + co,
         )
+        _set_cache("get_token_stats", result)
+        return result
 
 
 def list_token_daily_stats(*, days: int = 30) -> List[DailyTokenStat]:

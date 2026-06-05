@@ -67,12 +67,10 @@ class Brain:
         if not self.tmp_dir.exists():
             self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # code_agent (OpenCode) 子进程已不再使用 — SinkFinder 已改为原生工具多轮 LLM 循环。
-        # 保留 OpenCodeTool 类与配置以兼容前端管理页面，但不启动子进程。
-        # if not self.offline_mode:
-        #     self._init_code_agent(kwargs.get("opencode_runtime"))
-        # else:
-        #     self._log("INFO", "[Brain] 脱机模式，跳过 OpenCode 初始化")
+        if not self.offline_mode:
+            self._init_code_agent(kwargs.get("opencode_runtime"))
+        else:
+            self._log("INFO", "[Brain] 脱机模式，跳过 OpenCode 初始化")
 
         self.project_info_session_id = ""
 
@@ -161,14 +159,17 @@ class Brain:
             raise
 
     # ---------------- 日志辅助 ----------------
-    def _log(self, level: str, message: str) -> Optional[str]:
-        return self._bus.publish(
-            LogEvent(level=level, module=self.module_name, message=message, task_id=self.task_id)
-        )
+    def _log(self, level: str, message: str) -> None:
+        try:
+            get_event_bus().publish_async(
+                LogEvent(level=level, module=self.module_name, message=message, task_id=self.task_id)
+            )
+        except Exception:
+            pass
 
     def _emit_log_only(self, level: str, message: str) -> None:
         try:
-            self._bus.publish(
+            get_event_bus().publish_async(
                 LogEvent(level=level, module=self.DEFAULT_MODULE, message=message, task_id=self.task_id)
             )
         except Exception:
