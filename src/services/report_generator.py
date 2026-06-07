@@ -69,6 +69,11 @@ def _severity_label(severity: str) -> str:
         return "Low"
     return severity
 
+SCAN_SOURCES = frozenset({"quick_scan", "component_scan", "pattern_analyzer", "gapfill", "file_review"})
+
+
+# ---------- HTML 报告入口 ----------
+
 
 def generate_html_report(
     task_id: str,
@@ -100,9 +105,9 @@ def generate_html_report(
 
     # 分离快速扫描和 LLM 发现
     if quick_scan_findings is None:
-        quick_scan_findings = [f for f in findings if f.get("source") in ("quick_scan", "component_scan")]
+        quick_scan_findings = [f for f in findings if f.get("source") in SCAN_SOURCES]
     if llm_findings is None:
-        llm_findings = [f for f in findings if f.get("source") not in ("quick_scan", "component_scan")]
+        llm_findings = [f for f in findings if f.get("source") not in SCAN_SOURCES]
 
     # 漏洞统计：分别统计快扫和 LLM，确保与 API 数据一致
     severity_counts = {"C": 0, "H": 0, "M": 0, "L": 0}
@@ -363,7 +368,7 @@ def _render_finding(index: int, f: Dict[str, Any], source_badge_class: str) -> s
     conf_pct = int(confidence * 100) if isinstance(confidence, (int, float)) else 0
 
     # 来源标签
-    source_label = {"quick_scan": "规则扫描", "component_scan": "组件扫描", "llm": "LLM复核"}.get(source, source)
+    source_label = {"quick_scan": "规则扫描", "component_scan": "组件扫描", "pattern_analyzer": "模式匹配", "gapfill": "覆盖盲区", "file_review": "文件审计", "llm": "LLM复核"}.get(source, source)
 
     # Sink + 证据点摘要
     sink_html = ""

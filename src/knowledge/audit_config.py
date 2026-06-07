@@ -104,6 +104,42 @@ VULN_CWE_MAP: Dict[str, str] = {
     "SSTI": "CWE-94",
     "RACE_CONDITION": "CWE-362",
     "INFINITE_LOOP": "CWE-835",
+    "MISSING_AUTHENTICATION": "CWE-306",
+    "MISSING_ACCESS_CONTROL": "CWE-862",
+    "RESOURCE_LEAK": "CWE-404",
+}
+
+# === LLM 输出类型名规范化映射 ===
+# 将 Phase3C FileReview / QuickScanVerifier 产出的碎片化名称合并为标准名
+
+VULN_TYPE_NORMALIZE: Dict[str, str] = {
+    # 硬编码凭据碎片化 → 统一
+    "HARD_CODE_PASSWORD": "HARDCODED_CREDENTIALS",
+    "HARDCODED_SECRETS": "HARDCODED_CREDENTIALS",
+    "HARDCODED_CREDENTIAL": "HARDCODED_CREDENTIALS",
+    "PLAINTEXT_PASSWORD_STORAGE": "HARDCODED_CREDENTIALS",
+    "PLAINTEXT_PASSWORD": "HARDCODED_CREDENTIALS",
+    "CREDENTIALS_IN_URL": "HARDCODED_CREDENTIALS",
+    # 信息泄露碎片化 → 统一
+    "INFORMATION_EXPOSURE": "INFORMATION_DISCLOSURE",
+    "INFORMATION_LEAK": "INFORMATION_DISCLOSURE",
+    "INFORMATION_LEAKAGE": "INFORMATION_DISCLOSURE",
+    "INFO_LEAK": "INFORMATION_DISCLOSURE",
+    # 认证碎片化
+    "AUTH_MISSING": "MISSING_AUTHENTICATION",
+    "AUTH_BYPASS": "MISSING_AUTHENTICATION",
+    "PERMISSION_BYPASS": "MISSING_ACCESS_CONTROL",
+    # 加密碎片化
+    "INSECURE_CIPHER_MODE": "WEAK_CRYPTO",
+    "SIGN_VERIFICATION_BYPASS": "WEAK_CRYPTO",
+    # 其他碎片化
+    "INSECURE_SCRIPT_EXECUTION": "COMMAND_INJECTION",
+    "INSECURE_RANDOM": "PREDICTABLE_RANDOM",
+    "FILE_OPERATIONS": "PATH_TRAVERSAL",
+    "HTTP_HEADER_INJECTION": "CRLF_INJECTION",
+    "RESOURCE_EXHAUSTION": "UNCONTROLLED_MEMORY",
+    "IDEMPOTENCY": "BUSINESS_LOGIC",
+    "PARAMETER_TAMPERING": "BUSINESS_LOGIC",
 }
 
 # === DKTSS 基础评分表 ===
@@ -115,15 +151,25 @@ DKTSS_BASE_SCORES: Dict[str, Any] = {
     "SQL_INJECTION": {"write": 8, "read": 6, "default": 7},
     "SSRF": {"internal": 7, "http_only": 4, "default": 5},
     "AUTH_BYPASS": 8,
+    "MISSING_AUTHENTICATION": 8,
+    "MISSING_ACCESS_CONTROL": 7,
     "IDOR": 7,
     "XSS": {"stored": 6, "reflected": 5, "default": 5},
     "XXE": 6,
     "PATH_TRAVERSAL": 6,
     "FILE_UPLOAD": 6,
+    "HARDCODED_CREDENTIALS": 7,
     "WEAK_CRYPTO": 5,
     "WEAK_HASH": 4,
     "HARD_CODE_PASSWORD": 7,
     "LOG_INJECTION": 4,
+    "RACE_CONDITION": 5,
+    "SESSION_FIXATION": 5,
+    "CSRF": 7,
+    "PLAINTEXT_TRANSMISSION": 6,
+    "PREDICTABLE_RANDOM": 5,
+    "RESOURCE_LEAK": 3,
+    "BUSINESS_LOGIC": 5,
     "default": 5,
 }
 
@@ -231,16 +277,30 @@ COMPONENT_VULN_RULES: Dict[str, List[Dict[str, Any]]] = {
 # 用于 CodeCommentParser 解析代码注释中的抑制标记
 
 SUPPRESSION_PATTERNS: List[re.Pattern] = [
-    re.compile(r"gbt:\s*disable\s+([\w\-]+)", re.I),
-    re.compile(r"gbt-disable:\s*([\w\-]+)", re.I),
-    re.compile(r"gbt:\s*ignore\s+([\w\-]+)", re.I),
-    re.compile(r"ignore:\s*([\w\-]+)", re.I),
-    re.compile(r"eslint-disable-next-line\s+([\w\-]+)", re.I),
-    re.compile(r"eslint-disable-line\s+([\w\-]+)", re.I),
-    re.compile(r"tslint:disable-next-line\s+([\w\-]+)", re.I),
-    re.compile(r"tslint:disable\s+([\w\-]+)", re.I),
-    re.compile(r"pylint:\s*disable\s*=\s*([\w\-]+)", re.I),
-    re.compile(r"noinspection\s+([\w\-]+)", re.I),
+    # gbt-codeagent 原生抑制标记
+    re.compile(r"gbt:\s*disable\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"gbt-disable:\s*([\w\-]+)", re.IGNORECASE),
+    re.compile(r"gbt:\s*ignore\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"audit:\s*ignore\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"audit:\s*skip\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"@auditskip\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"@nosafety\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"nosafety:\s*([\w\-]+)", re.IGNORECASE),
+    # ESLint / TSLint
+    re.compile(r"eslint-disable-next-line\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"eslint-disable-line\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"tslint:disable-next-line\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"tslint:disable\s+([\w\-]+)", re.IGNORECASE),
+    # Pylint / PyCharm
+    re.compile(r"pylint:\s*disable\s*=\s*([\w\-]+)", re.IGNORECASE),
+    re.compile(r"noinspection\s+([\w\-]+)", re.IGNORECASE),
+    # 通用抑制
+    re.compile(r"ignore:\s*([\w\-]+)", re.IGNORECASE),
+    re.compile(r"suppress\s+audit\s+([\w\-]+)", re.IGNORECASE),
+    # 注释标记安全例外
+    re.compile(r"SAFE:\s*([\w\-]+)", re.IGNORECASE),
+    re.compile(r"@safe\s+([\w\-]+)", re.IGNORECASE),
+    re.compile(r"noscan:\s*([\w\-]+)", re.IGNORECASE),
 ]
 
 

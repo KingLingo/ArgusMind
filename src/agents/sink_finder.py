@@ -607,6 +607,48 @@ class SinkFinder(BaseAgent):
     def __init__(self, brain: Optional[Brain] = None):
         super().__init__(brain)
         self.max_retries = 10
+        # 混合模式已退役：不再使用 OpenCode
+
+        # 提前终止：连续无发现轮次阈值
+        self._early_stop_consecutive_empty = 4  # 连续4轮工具调用无实质发现则提前退出
+
+    @staticmethod
+    def _is_tool_result_substantive(tool_result: Any, tool_name: str) -> bool:
+        """判断工具调用结果是否包含实质发现（非空结果）。
+
+        用于提前终止机制：如果连续多轮工具调用都返回空结果，
+        说明该漏洞类型在项目中可能不存在，可以提前退出。
+        """
+        if not isinstance(tool_result, dict):
+            return tool_result is not None
+
+        # success=False 的结果不算实质发现
+        if not tool_result.get("success", True):
+            return False
+
+        # ripgrep / search 类工具：检查匹配数
+        data = tool_result.get("data", tool_result)
+        if isinstance(data, dict):
+            # 匹配数为 0 或空列表
+            matches = data.get("matches", data.get("results", data.get("lines", None)))
+            if matches is not None:
+                if isinstance(matches, (list, str)):
+                    return len(matches) > 0
+                return bool(matches)
+            # 文件列表为空
+            files = data.get("files", data.get("file_list", None))
+            if files is not None:
+                return len(files) > 0 if isinstance(files, list) else bool(files)
+
+        # read_file / read_lines：有内容就算实质发现
+        if tool_name.startswith("read_"):
+            content = tool_result.get("content", tool_result.get("data", ""))
+            if isinstance(content, str):
+                return len(content.strip()) > 0
+            return bool(content)
+
+        # 默认：有结果就算实质发现
+        return True
 
     def _build_quick_scan_hint(self, vul_name: str, language: str) -> str:
         """从快速扫描结果中提取与当前漏洞类型相关的线索，按需注入。"""
@@ -666,6 +708,72 @@ class SinkFinder(BaseAgent):
             evidence = f.get("evidence", "")
             hint += f"- **{location}** [{severity}] {evidence}\n"
         hint += "\n注意：以上线索来自正则规则匹配，可能存在误报，请结合代码上下文验证。\n"
+        return hint
+
+    def _build_pattern_hint(self, vul_name: str, language: str) -> str:
+        """从共享缓存（Orchestrator 已运行过的 PatternAnalyzer）提取相关线索。
+
+        不再重复 os.walk + PatternAnalyzer — 避免每个 category 都触发完整扫描。
+        """
+        if not self._brain or not hasattr(self._brain, "pattern_analyzer_results"):
+            return ""
+        pa_result = self._brain.pattern_analyzer_results
+        if not pa_result:
+            return ""
+
+        # 漏洞类型到英文映射（精简版）
+        vuln_type_en_map = {
+            "命令注入": "COMMAND_INJECTION", "命令执行": "COMMAND_INJECTION",
+            "SQL注入": "SQL_INJECTION", "代码执行": "CODE_INJECTION",
+            "代码注入": "CODE_INJECTION", "RCE": "CODE_INJECTION",
+            "路径遍历": "PATH_TRAVERSAL", "目录遍历": "PATH_TRAVERSAL",
+            "XSS": "XSS", "跨站脚本": "XSS",
+            "SSRF": "SSRF", "服务端请求伪造": "SSRF",
+            "XXE": "XXE", "XML外部实体": "XXE",
+            "反序列化": "DESERIALIZATION", "不安全反序列化": "DESERIALIZATION",
+            "认证绕过": "AUTH_BYPASS",
+            "文件上传": "FILE_UPLOAD",
+            "弱加密": "WEAK_CRYPTO", "弱哈希": "WEAK_HASH",
+            "硬编码凭据": "HARDCODED_CREDENTIALS", "硬编码密码": "HARDCODED_CREDENTIALS",
+            "开放重定向": "OPEN_REDIRECT",
+            "JWT": "JWT_VULNERABILITIES",
+            "SSTI": "SSTI", "JNDI": "JNDI_INJECTION",
+            "日志注入": "LOG_INJECTION", "信息泄露": "INFORMATION_DISCLOSURE",
+            "竞态条件": "RACE_CONDITION", "缓冲区溢出": "BUFFER_OVERFLOW",
+        }
+
+        matched_types: set[str] = set()
+        for key, en_type in vuln_type_en_map.items():
+            if key.lower() in vul_name.lower() or vul_name.lower() in key.lower():
+                matched_types.add(en_type)
+        matched_types.add(vul_name.upper().replace(" ", "_").replace("/", "_"))
+
+        if not matched_types:
+            return ""
+
+        # 从缓存中提取匹配的发现
+        import os as _os
+        matched_files: dict = {}
+        for r in pa_result.get("results", []):
+            for f in r.get("findings", []):
+                f_type = f.get("vuln_type", "")
+                if f_type in matched_types:
+                    fp = f.get("file_path", "")
+                    if fp and fp not in matched_files:
+                        matched_files[fp] = (f.get("line", 0), f.get("severity", "MEDIUM"), f.get("evidence", "")[:60])
+                        if len(matched_files) >= 10:
+                            break
+            if len(matched_files) >= 10:
+                break
+
+        if not matched_files:
+            return ""
+
+        hint = "\n\n## 代码模式分析线索（独立模式匹配引擎，无需 sink 点）\n"
+        hint += "以下代码位置检测到了与当前漏洞类型相关的危险模式：\n"
+        for fp, (line, severity, evidence) in matched_files.items():
+            hint += f"- **{_os.path.basename(fp)}:{line}** [{severity}] `{evidence}`\n"
+        hint += "\n注意：以上线索来自预扫描的 PatternAnalyzer 缓存，无需 sink 点即可能发现问题。\n"
         return hint
 
     def _build_gapfill_hint(self, vul_name: str) -> str:
@@ -795,15 +903,12 @@ class SinkFinder(BaseAgent):
         if quick_scan_hint:
             system_content += quick_scan_hint
 
-        # 注入防漏报兜底盲区提示（按需，仅匹配当前漏洞类型）
-        gapfill_hint = self._build_gapfill_hint(vul_name)
-        if gapfill_hint:
-            system_content += gapfill_hint
-
-        # RAG 按需知识检索（仅检索与当前漏洞类型相关的知识文档）
-        rag_hint = self._build_rag_hint(vul_name)
-        if rag_hint:
-            system_content += rag_hint
+        # 注入 PatternAnalyzer 模式匹配线索（从缓存读取，无需重复扫描）
+        pattern_hint = self._build_pattern_hint(vul_name, language)
+        if pattern_hint:
+            system_content += pattern_hint
+            self._publish_log("DEBUG",
+                              f"[SinkFinder] PatternAnalyzer 缓存命中 {vul_name}")
 
         # 注入漏洞类型审计指南（框架感知检测矩阵、危险模式示例、CWE/国标）
         try:
@@ -814,24 +919,6 @@ class SinkFinder(BaseAgent):
         except Exception:
             pass
 
-        # 注入安全领域 MD（按漏洞类型匹配）
-        try:
-            from src.knowledge.md_loader import inject_domain_knowledge
-            domain_md = inject_domain_knowledge(vul_name, max_domains=2)
-            if domain_md:
-                system_content += domain_md
-        except Exception:
-            pass
-
-        # 注入框架安全 MD（按语言匹配）
-        try:
-            from src.knowledge.md_loader import inject_framework_knowledge
-            framework_md = inject_framework_knowledge(language, max_frameworks=2)
-            if framework_md:
-                system_content += framework_md
-        except Exception:
-            pass
-
         msg = [
             {"role": "system",
              "content": system_content},
@@ -839,9 +926,7 @@ class SinkFinder(BaseAgent):
             {"role": "user",
              "content": f"本次审计**目标**：\n语言：{language}\n漏洞类型：{vul_name} \n漏洞描述：{risk_description}\n相关依据:{reasoning_basis}"}
         ]
-        # code_agent 已移除，sink 发现改为原生工具多轮 LLM 循环
         result_file_path = str(self._brain.tmp_dir / f"{generate_uuid()}.txt")
-
         sink_res = []
 
         sink_finder_span = start_event_span(
@@ -855,149 +940,189 @@ class SinkFinder(BaseAgent):
             f"[SinkFinder] 开始 sink 发现 | language={language} vul_name={vul_name} "
             f"vul_node_id={vul_node_id}",
         )
+
+        # ── 直接使用 LLM 多轮工具循环发现 sink（不再使用 OpenCode）──
+        self._publish_log(
+            "INFO",
+            f"[SinkFinder] 使用 LLM 多轮工具循环 | language={language} vul_name={vul_name}",
+        )
+        msg = [
+            {"role": "system",
+             "content": system_content},
+            {"role": "user", "content": "项目信息：\n" + self._brain.project_info},
+            {"role": "user",
+             "content": f"本次审计**目标**：\n语言：{language}\n漏洞类型：{vul_name} \n漏洞描述：{risk_description}\n相关依据:{reasoning_basis}"}
+        ]
+        result_file_path = str(self._brain.tmp_dir / f"{generate_uuid()}.txt")
+        sink_res = []
         input_tokens, output_tokens = 0, 0
+        consecutive_empty_rounds = 0
         for step in range(self.max_retries):
-            ensure_task_running(self._brain.task_id)
-            self._publish_log(
-                "INFO",
-                f"[SinkFinder] LLM 轮次 {step + 1}/{self.max_retries}",
-            )
-            try:
-                res, input_tokens, output_tokens = self._llm_step(msg)
-            except LLMError:
-                sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                sink_finder_span.mark_failed("LLM 调用发生致命错误")
-                raise
-            except ValueError as e:
-                sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                msg.append({"role": "assistant", "content": "(模型返回内容无法解析为JSON)"})
-                msg.append({
-                    "role": "user",
-                    "content": json.dumps({
-                        "error": "INVALID_JSON",
-                        "detail": str(e),
-                        "requirement": "请严格按统一输出协议只返回JSON对象"
-                    }, ensure_ascii=False)
-                })
-                continue
-            except Exception as e:
-                sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                tb = traceback.format_exc()
-                tail = tb[-4000:] if len(tb) > 4000 else tb
-                self._publish_log("ERROR", f"[SinkFinder] LLM 调用异常: {e!r}\n{tail}")
-                raise RuntimeError(f"调用 LLM 时发生错误: {e}") from e
-
-            if res is None:
-                sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-                self._publish_log("WARNING", f"[SinkFinder] LLM 返回为空，重试 ({step + 1}/{self.max_retries})")
-                continue
-
-            next_action = (res or {}).get("next_action", {}) or {}
-            action_type = next_action.get("type", "")
-
-            # ---- 工具调用（所有工具均可使用） ----
-            if action_type == "tool_call":
-                tool_name = next_action.get("tool_name", "")
-                if not tool_name:
+                ensure_task_running(self._brain.task_id)
+                self._publish_log(
+                    "INFO",
+                    f"[SinkFinder] LLM 轮次 {step + 1}/{self.max_retries}",
+                )
+                try:
+                    res, input_tokens, output_tokens = self._llm_step(msg)
+                except LLMError:
                     sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                    sink_finder_span.mark_failed("LLM 调用发生致命错误")
+                    raise
+                except ValueError as e:
+                    sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                    msg.append({"role": "assistant", "content": "(模型返回内容无法解析为JSON)"})
                     msg.append({
                         "role": "user",
                         "content": json.dumps({
-                            "error": "MISSING_TOOL_NAME",
-                            "requirement": "tool_call 需要提供 tool_name"
+                            "error": "INVALID_JSON",
+                            "detail": str(e),
+                            "requirement": "请严格按统一输出协议只返回JSON对象"
                         }, ensure_ascii=False)
                     })
                     continue
+                except Exception as e:
+                    sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                    tb = traceback.format_exc()
+                    tail = tb[-4000:] if len(tb) > 4000 else tb
+                    self._publish_log("ERROR", f"[SinkFinder] LLM 调用异常: {e!r}\n{tail}")
+                    raise RuntimeError(f"调用 LLM 时发生错误: {e}") from e
 
-                self._publish_log("INFO", f"[SinkFinder] 调用工具 {tool_name!r} (轮 {step + 1})")
-                tool_span = start_event_span(
-                    task_id=self._brain.task_id,
-                    module=self.MODULE_NAME,
-                    action_type=ActionType.TOOL_CALL,
-                    tool_name=tool_name,
-                    reason=f"调用 {tool_name} 工具",
-                    tool_arguments=next_action.get('arguments', {}) or {},
-                )
-                tool_result = self._execute_tool_call(next_action, msg, tool_span)
-                tool_span.set_output(json.dumps(tool_result, ensure_ascii=False, default=str))
-                tool_span.add_llm_tokens(input_tokens, output_tokens)
-                if tool_result is None:
-                    tool_span.mark_failed("工具调用未返回结果")
-                else:
-                    tool_span.finish()
-                if tool_result is not None:
-                    msg.append({
-                        "role": "user",
-                        "content": json.dumps({
-                            "status": "TOOL_RESULT",
-                            "tool_name": tool_name,
-                            "result": tool_result,
-                        }, ensure_ascii=False, default=str),
-                    })
-                continue
-
-            # ---- final：LLM 直接产出 sink JSON 数组 ----
-            if action_type == "final":
-                final_output = res.get("final_output")
-                if not isinstance(final_output, list):
-                    self._publish_log("WARNING", "[SinkFinder] final 缺少有效的 final_output 数组")
-                    msg.append({
-                        "role": "user",
-                        "content": json.dumps({
-                            "error": "FINAL_WITHOUT_OUTPUT",
-                            "requirement": "type=final 时 final_output 必须是 JSON 数组",
-                        }, ensure_ascii=False),
-                    })
+                if res is None:
+                    sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                    self._publish_log("WARNING", f"[SinkFinder] LLM 返回为空，重试 ({step + 1}/{self.max_retries})")
                     continue
 
-                self._publish_log("INFO", f"[SinkFinder] LLM 返回 final，sink 候选={len(final_output)}")
-                normalized, err = _validate_and_normalize_sink_res(final_output, self._brain.project_path)
-                if err:
-                    self._publish_log(
-                        "WARNING",
-                        f"[SinkFinder] sink 格式校验失败 | code={err.get('code')} "
-                        f"field={err.get('field')} message={err.get('message')}",
+                next_action = (res or {}).get("next_action", {}) or {}
+                action_type = next_action.get("type", "")
+
+                # ---- 工具调用 ----
+                if action_type == "tool_call":
+                    tool_name = next_action.get("tool_name", "")
+                    if not tool_name:
+                        sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                        msg.append({
+                            "role": "user",
+                            "content": json.dumps({
+                                "error": "MISSING_TOOL_NAME",
+                                "requirement": "tool_call 需要提供 tool_name"
+                            }, ensure_ascii=False)
+                        })
+                        continue
+
+                    self._publish_log("INFO", f"[SinkFinder] 调用工具 {tool_name!r} (轮 {step + 1})")
+                    tool_span = start_event_span(
+                        task_id=self._brain.task_id,
+                        module=self.MODULE_NAME,
+                        action_type=ActionType.TOOL_CALL,
+                        tool_name=tool_name,
+                        reason=f"调用 {tool_name} 工具",
+                        tool_arguments=next_action.get('arguments', {}) or {},
                     )
-                    fix_detail = json.dumps({
-                        "error": "INVALID_SINK_FORMAT",
-                        "validation": err,
-                        "schema_hint": _SINK_RES_SCHEMA_HINT,
-                        "requirement": "请修正上述 sink 项后重新输出 final",
-                    }, ensure_ascii=False)
-                    msg.append({"role": "user", "content": fix_detail})
+                    tool_result = self._execute_tool_call(next_action, msg, tool_span)
+                    tool_span.set_output(json.dumps(tool_result, ensure_ascii=False, default=str))
+                    tool_span.add_llm_tokens(input_tokens, output_tokens)
+                    if tool_result is None:
+                        tool_span.mark_failed("工具调用未返回结果")
+                    else:
+                        tool_span.finish()
+                    if tool_result is not None:
+                        msg.append({
+                            "role": "user",
+                            "content": json.dumps({
+                                "status": "TOOL_RESULT",
+                                "tool_name": tool_name,
+                                "result": tool_result,
+                            }, ensure_ascii=False, default=str),
+                        })
+                        if self._is_tool_result_substantive(tool_result, tool_name):
+                            consecutive_empty_rounds = 0
+                        else:
+                            consecutive_empty_rounds += 1
+                    else:
+                        consecutive_empty_rounds += 1
+
+                    # 提前终止：连续多轮工具调用无实质发现
+                    if consecutive_empty_rounds >= self._early_stop_consecutive_empty:
+                        self._publish_log(
+                            "INFO",
+                            f"[SinkFinder] 提前终止 | 连续 {consecutive_empty_rounds} 轮工具调用无实质发现",
+                        )
+                        _info_span = start_event_span(
+                            task_id=self._brain.task_id,
+                            module=self.MODULE_NAME,
+                            action_type=ActionType.INFORMATION,
+                            reason=f"{language} 语言的 {vul_name} 类型连续{consecutive_empty_rounds}轮无发现，提前终止",
+                        )
+                        _info_span.finish()
+                        break
                     continue
 
-                self._publish_log("INFO", f"[SinkFinder] sink 校验通过 | count={len(normalized)}")
-                start_event_span(
-                    task_id=self._brain.task_id,
-                    module=self.MODULE_NAME,
-                    action_type=ActionType.INFORMATION,
-                    reason=f"{language} 语言的 {vul_name} 类型共发现{len(normalized)}条sink点",
-                )
-                sink_res = normalized
-                break
+                # ---- final：LLM 直接产出 sink JSON 数组 ----
+                if action_type == "final":
+                    final_output = res.get("final_output")
+                    if not isinstance(final_output, list):
+                        self._publish_log("WARNING", "[SinkFinder] final 缺少有效的 final_output 数组")
+                        msg.append({
+                            "role": "user",
+                            "content": json.dumps({
+                                "error": "FINAL_WITHOUT_OUTPUT",
+                                "requirement": "type=final 时 final_output 必须是 JSON 数组",
+                            }, ensure_ascii=False),
+                        })
+                        continue
 
-            # ---- 无效 action_type ----
-            sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
-            self._publish_log(
-                "WARNING",
-                f"[SinkFinder] 无效 next_action.type={action_type!r} (轮 {step + 1})",
-            )
-            msg.append({"role": "assistant", "content": json.dumps(res, ensure_ascii=False)})
-            msg.append({
-                "role": "user",
-                "content": json.dumps({
-                    "error": "INVALID_NEXT_ACTION",
-                    "requirement": "next_action.type 只能是 tool_call 或 final"
-                }, ensure_ascii=False)
-            })
-            continue
+                    self._publish_log("INFO", f"[SinkFinder] LLM 返回 final，sink 候选={len(final_output)}")
+                    normalized, err = _validate_and_normalize_sink_res(final_output, self._brain.project_path)
+                    if err:
+                        self._publish_log(
+                            "WARNING",
+                            f"[SinkFinder] sink 格式校验失败 | code={err.get('code')} "
+                            f"field={err.get('field')} message={err.get('message')}",
+                        )
+                        fix_detail = json.dumps({
+                            "error": "INVALID_SINK_FORMAT",
+                            "validation": err,
+                            "schema_hint": _SINK_RES_SCHEMA_HINT,
+                            "requirement": "请修正上述 sink 项后重新输出 final",
+                        }, ensure_ascii=False)
+                        msg.append({"role": "user", "content": fix_detail})
+                        continue
+
+                    self._publish_log("INFO", f"[SinkFinder] sink 校验通过 | count={len(normalized)}")
+                    _info_span = start_event_span(
+                        task_id=self._brain.task_id,
+                        module=self.MODULE_NAME,
+                        action_type=ActionType.INFORMATION,
+                        reason=f"{language} 语言的 {vul_name} 类型共发现{len(normalized)}条sink点",
+                    )
+                    _info_span.finish()
+                    sink_res = normalized
+                    break
+
+                # ---- 无效 action_type ----
+                sink_finder_span.add_llm_tokens(input_tokens, output_tokens)
+                self._publish_log(
+                    "WARNING",
+                    f"[SinkFinder] 无效 next_action.type={action_type!r} (轮 {step + 1})",
+                )
+                msg.append({"role": "assistant", "content": json.dumps(res, ensure_ascii=False)})
+                msg.append({
+                    "role": "user",
+                    "content": json.dumps({
+                        "error": "INVALID_NEXT_ACTION",
+                        "requirement": "next_action.type 只能是 tool_call 或 final"
+                    }, ensure_ascii=False)
+                })
+                continue
 
         if not sink_res:
             self._publish_log(
                 "WARNING",
                 f"[SinkFinder] 主循环结束但未发现有效 sink | max_retries={self.max_retries}",
             )
+
+        # ── 混合模式增强已移除（不再使用 OpenCode）──
 
         if sink_res:
             sink_res_backup = deepcopy(sink_res)
@@ -1294,12 +1419,13 @@ class SinkRefineAgent(BaseAgent):
                     "INFO",
                     f"[SinkRefineAgent] 精炼完成 | before={len(fallback_sink_res)} after={len(normalized)}",
                 )
-                start_event_span(
+                _info_span = start_event_span(
                     task_id=self._brain.task_id,
                     module=self.MODULE_NAME,
                     action_type=ActionType.INFORMATION,
                     reason=f"{language} 语言的 {vul_name} 类型sink点经过处理剩余{len(normalized)}条",
                 )
+                _info_span.finish()
                 sink_refine_span.finish()
                 return normalized
 

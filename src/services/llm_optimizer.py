@@ -602,13 +602,22 @@ class LLMOptimizer:
     @staticmethod
     def rank_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """按严重等级 → 置信度 → CVSS 排序。"""
+        def get_numeric_value(val, default=0):
+            """安全地将值转换为数字类型"""
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+        
         return sorted(
             findings,
             key=lambda f: (
                 _SEVERITY_ORDER.get(str(f.get("severity", "")).lower(), 5),
-                -(f.get("confidence", 0) or 0),
-                -(f.get("cvssScore", f.get("cvss_score", 0)) or 0),
-            ),
+                -get_numeric_value(f.get("confidence", 0)),
+                -get_numeric_value(f.get("cvssScore", f.get("cvss_score", 0))),
+            )
         )
 
     # ---------- 完整优化管线 ----------

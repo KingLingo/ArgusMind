@@ -1,5 +1,5 @@
-import { BugOutlined } from '@ant-design/icons';
-import type { ActionType, ProColumns } from '@ant-design/pro-components';
+import { BugOutlined, DownloadOutlined } from '@ant-design/icons';
+import type { ActionType, ProColumns, ProFormInstance } from '@ant-design/pro-components';
 import { PageContainer, ProTable } from '@ant-design/pro-components';
 import { history, useLocation } from '@umijs/max';
 import { Button, message, Popconfirm, Tag, Typography } from 'antd';
@@ -14,6 +14,7 @@ import {
   type VulnSeverity,
   type VulnStatus,
 } from '@/services/vulnerabilities';
+import { exportVulnerabilities } from '@/services/vulnerabilities';
 import { formatUtcForLocalDisplay } from '@/utils/utcDateTimeDisplay';
 import { useVulnerabilityPageStyles } from './vulnerabilityStyles';
 import {
@@ -38,6 +39,7 @@ function readIdFromSearch(
 
 const VulnerabilitiesPage: React.FC = () => {
   const actionRef = useRef<ActionType>(null);
+  const formRef = useRef<ProFormInstance>(undefined);
   const location = useLocation();
   const { styles } = useVulnerabilityPageStyles();
   const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null);
@@ -190,7 +192,14 @@ const VulnerabilitiesPage: React.FC = () => {
     {
       title: '来源',
       dataIndex: 'source',
-      search: false,
+      valueEnum: {
+        quick_scan: { text: '规则扫描' },
+        pattern_analyzer: { text: '模式匹配' },
+        chain_analysis: { text: '链路分析' },
+        file_review: { text: '文件审计' },
+        gapfill: { text: '覆盖盲区' },
+        component_scan: { text: '组件扫描' },
+      },
       width: 90,
       render: (_, record) => {
         const source = record.source ?? 'quick_scan';
@@ -343,9 +352,29 @@ const VulnerabilitiesPage: React.FC = () => {
           </Typography.Text>
         }
         actionRef={actionRef}
+        formRef={formRef}
         rowKey="id"
         scroll={{ x: 1320 }}
         form={{ initialValues: formInitialValues }}
+        toolBarRender={() => [
+          <Button
+            key="export"
+            icon={<DownloadOutlined />}
+            onClick={() => {
+              const form = formRef.current?.getFieldsValue?.();
+              exportVulnerabilities({
+                keyword: form?.keyword as string,
+                severity: form?.severity as VulnSeverity,
+                status: form?.status as VulnStatus,
+                source: form?.source as string,
+                projectId: form?.projectId as string,
+                taskId: form?.taskId as string,
+              });
+            }}
+          >
+            导出 Excel
+          </Button>,
+        ]}
         search={{
           labelWidth: 'auto',
           defaultCollapsed: false,
@@ -365,6 +394,7 @@ const VulnerabilitiesPage: React.FC = () => {
             keyword: params.keyword as string,
             severity: params.severity as VulnSeverity,
             status: params.status as VulnStatus,
+            source: params.source as string,
             projectId: params.projectId as string,
             taskId: params.taskId as string,
           });

@@ -528,6 +528,7 @@ const TasksPage: React.FC = () => {
         name: string;
         projectId: string;
         offlineMode: boolean;
+        enableSinkFinder: boolean;
       }>
         title="创建扫描任务"
         open={open}
@@ -547,6 +548,7 @@ const TasksPage: React.FC = () => {
               name: values.name,
               project_id: values.projectId,
               offline_mode: values.offlineMode ?? false,
+              enable_sink_finder: values.enableSinkFinder ?? false,
             });
             message.success('任务已创建');
             actionRef.current?.reload();
@@ -577,6 +579,14 @@ const TasksPage: React.FC = () => {
           name="offlineMode"
           label="脱机模式"
           tooltip="开启后仅使用规则引擎和快速扫描，不调用 LLM，可脱机运行"
+          fieldProps={{
+            defaultChecked: false,
+          }}
+        />
+        <ProFormSwitch
+          name="enableSinkFinder"
+          label="深度链路审计"
+          tooltip="启用后逐类型搜索危险函数并进行链路分析（SinkFinder + ChainAnalyzer），显著增加耗时，用于深度安全审计"
           fieldProps={{
             defaultChecked: false,
           }}

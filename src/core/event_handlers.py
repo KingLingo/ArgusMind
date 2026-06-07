@@ -100,8 +100,7 @@ def handle_task_status_event(ev: TaskStatusEvent) -> None:
         task.status = ev.status
         if ev.message:
             task.error = ev.message if ev.status == "failed" else task.error
-        if ev.vuln_count:
-            task.vuln_count = ev.vuln_count
+        task.vuln_count = ev.vuln_count
         if ev.status in {"completed", "failed", "cancelled"} and task.finished_at is None:
             task.finished_at = datetime.utcnow()
         if ev.status == "paused" and task.finished_at is not None:

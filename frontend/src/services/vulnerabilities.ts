@@ -248,6 +248,7 @@ export async function listVulnerabilities(params: {
   keyword?: string;
   severity?: VulnSeverity;
   status?: VulnStatus;
+  source?: string;
   projectId?: string;
   taskId?: string;
 }) {
@@ -259,6 +260,7 @@ export async function listVulnerabilities(params: {
     keyword: params.keyword || undefined,
     severity: params.severity || undefined,
     status: params.status || undefined,
+    source: params.source || undefined,
   });
 
   const [projects, tasks] = await Promise.all([
@@ -288,6 +290,37 @@ export async function deleteVulnerability(findingId: string) {
     `/api/findings/${encodeURIComponent(findingId)}`,
     { method: 'DELETE' },
   );
+}
+
+export function exportVulnerabilities(params: {
+  keyword?: string;
+  severity?: VulnSeverity;
+  status?: VulnStatus;
+  source?: string;
+  projectId?: string;
+  taskId?: string;
+}) {
+  const query = new URLSearchParams();
+  if (params.keyword) query.set('keyword', params.keyword);
+  if (params.severity) query.set('severity', params.severity);
+  if (params.status) query.set('status', params.status);
+  if (params.source) query.set('source', params.source);
+  if (params.projectId) query.set('project_id', params.projectId);
+  if (params.taskId) query.set('task_id', params.taskId);
+
+  request(`/api/findings/export?${query.toString()}`, {
+    responseType: 'blob',
+    skipErrorHandler: true,
+  }).then((blob: any) => {
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = `vulnerabilities-${Date.now()}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(blobUrl);
+  });
 }
 
 export async function updateVulnerabilityStatus(

@@ -6,6 +6,8 @@ declare namespace API {
     name: string;
     /** Offline Mode - skip LLM, use rules engine only */
     offline_mode?: boolean;
+    /** Enable SinkFinder - find dangerous functions + chain analysis, time-consuming */
+    enable_sink_finder?: boolean;
   };
 
   type BodyCreateProjectApiProjectsPost = {
@@ -294,6 +296,7 @@ declare namespace API {
     keyword?: string | null;
     severity?: string | null;
     status?: string | null;
+    source?: string | null;
     current?: number;
     pageSize?: number;
   };

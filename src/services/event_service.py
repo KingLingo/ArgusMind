@@ -145,6 +145,12 @@ def fail_running_non_information_events_for_task(task_id: str) -> int:
         return EventRepository(session).fail_running_non_information_by_task(task_id)
 
 
+def complete_running_events_for_task(task_id: str) -> int:
+    """将任务下所有仍为 running 的事件标为 completed（任务正常结束时兜底清理）。"""
+    with session_scope() as session:
+        return EventRepository(session).complete_running_by_task(task_id)
+
+
 def mark_event_completed(event_id: int) -> Optional[EventRecord]:
     """将 event 状态更新为 completed。"""
     with session_scope() as session:

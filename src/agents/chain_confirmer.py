@@ -241,7 +241,7 @@ class ChainConfirmer(BaseAgent):
         else:
             msg = "初次结果误报"
         try:
-            start_event_span(
+            _vul_span = start_event_span(
                 task_id=self._brain.task_id,
                 module=self.MODULE_NAME,
                 action_type=ActionType.VULNERABILITY,
@@ -255,6 +255,7 @@ class ChainConfirmer(BaseAgent):
                     "stage": "confirmer",
                 },
             )
+            _vul_span.finish()
         except Exception as e:
             msg = f"[ChainConfirmer] 二次校验结果事件上报失败（已忽略）: {e}"
             logger.warning(msg)

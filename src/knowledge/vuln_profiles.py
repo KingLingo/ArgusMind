@@ -1439,6 +1439,159 @@ VULN_PROFILES: Dict[str, Dict[str, Any]] = {
             },
         },
     },
+
+    # ── 明文传输 ──
+    "PLAINTEXT_TRANSMISSION": {
+        "cwe": "CWE-319",
+        "gbt": "GB/T39412-6.3.2.1",
+        "default_severity": "HIGH",
+        "desc": "明文传输敏感数据",
+        "languages": {
+            "java": {
+                "risk": [
+                    re.compile(r"URLConnection\s+\w+\s*=.*new\s+URL\(\s*[\"']http://"),
+                    re.compile(r"HttpURLConnection.*http://"),
+                    re.compile(r"RestTemplate.*http://"),
+                    re.compile(r"new\s+HttpClient\s*\("),
+                ],
+                "safe": [
+                    re.compile(r"https://"),
+                    re.compile(r"SSLSocketFactory"),
+                    re.compile(r"SSLContext"),
+                    re.compile(r"HttpsURLConnection"),
+                ],
+                "remediation": "使用 HTTPS 传输敏感数据，禁止使用 HTTP 明文协议",
+            },
+            "python": {
+                "risk": [
+                    re.compile(r"requests\.(get|post)\s*\([\"']http://"),
+                    re.compile(r"urllib.*urlopen\s*\([\"']http://"),
+                    re.compile(r"smtplib\.SMTP\s*\([^)]*\)"),
+                ],
+                "safe": [
+                    re.compile(r"requests\.(get|post)\s*\([\"']https://"),
+                    re.compile(r"verify\s*=\s*True"),
+                    re.compile(r"smtplib\.SMTP_SSL"),
+                ],
+                "remediation": "使用 HTTPS/TLS 加密传输，SMTP 使用 STARTTLS",
+            },
+            "javascript": {
+                "risk": [
+                    re.compile(r"fetch\s*\(\s*[\"']http://"),
+                    re.compile(r"axios\s*\(\s*\{[^}]*url\s*:\s*[\"']http://"),
+                    re.compile(r"XMLHttpRequest.*http://"),
+                ],
+                "safe": [
+                    re.compile(r"fetch\s*\(\s*[\"']https://"),
+                    re.compile(r"url\s*:\s*[\"']https://"),
+                ],
+                "remediation": "使用 HTTPS 传输敏感数据，禁止使用 HTTP 明文协议",
+            },
+        },
+    },
+
+    # ── 缺失认证（增强版） ──
+    "MISSING_AUTHENTICATION": {
+        "cwe": "CWE-306",
+        "gbt": "GB/T34944-6.2.7.1",
+        "default_severity": "HIGH",
+        "desc": "关键功能缺失身份认证",
+        "languages": {
+            "java": {
+                "risk": [
+                    re.compile(r"@RestController|@Controller"),
+                    re.compile(r"@GetMapping|@PostMapping|@RequestMapping"),
+                    re.compile(r"public\s+\w+\s+\w+\s*\(\s*HttpServletRequest"),
+                ],
+                "safe": [
+                    re.compile(r"@PreAuthorize|@Secured"),
+                    re.compile(r"SecurityContextHolder\.getContext\(\)"),
+                    re.compile(r"@AuthenticationPrincipal"),
+                    re.compile(r"Authentication\s+"),
+                ],
+                "remediation": "为所有敏感端点添加认证注解或使用 Spring Security 过滤器链",
+            },
+            "python": {
+                "risk": [
+                    re.compile(r"@app\.route|@bp\.route"),
+                    re.compile(r"def\s+\w+\s*\([^)]*request"),
+                ],
+                "safe": [
+                    re.compile(r"@login_required|@jwt_required"),
+                    re.compile(r"request\.user|current_user"),
+                ],
+                "remediation": "为敏感路由添加认证装饰器",
+            },
+            "javascript": {
+                "risk": [
+                    re.compile(r"app\.(get|post)\s*\([^)]*"),
+                    re.compile(r"router\.(get|post)\s*\([^)]*"),
+                ],
+                "safe": [
+                    re.compile(r"ensureLoggedIn|authenticate|jwt.*middleware"),
+                ],
+                "remediation": "为敏感路由添加认证中间件",
+            },
+        },
+    },
+
+    # ── 缺失访问控制 ──
+    "MISSING_ACCESS_CONTROL": {
+        "cwe": "CWE-862",
+        "gbt": "GB/T39412-6.3.3.1",
+        "default_severity": "HIGH",
+        "desc": "关键功能缺失访问控制/权限校验",
+        "languages": {
+            "java": {
+                "risk": [
+                    re.compile(r"@RestController|@Controller"),
+                    re.compile(r"@GetMapping|@PostMapping|@DeleteMapping"),
+                ],
+                "safe": [
+                    re.compile(r"@PreAuthorize\s*\([^)]*hasRole"),
+                    re.compile(r"@PreAuthorize\s*\([^)]*hasAuthority"),
+                    re.compile(r"@RolesAllowed"),
+                    re.compile(r"SecurityContextHolder.*getAuthority"),
+                ],
+                "remediation": "为所有状态变更和敏感查询端点添加角色/权限检查",
+            },
+        },
+    },
+
+    # ── 资源未关闭/泄漏 ──
+    "RESOURCE_LEAK": {
+        "cwe": "CWE-404",
+        "default_severity": "MEDIUM",
+        "desc": "资源未正确关闭（文件流、连接、Reader等）",
+        "languages": {
+            "java": {
+                "risk": [
+                    re.compile(r"new\s+(FileInputStream|FileOutputStream|BufferedReader)\s*\("),
+                    re.compile(r"Connection\s+\w+\s*=.*DriverManager\.getConnection"),
+                    re.compile(r"\.createStatement\s*\("),
+                    re.compile(r"\.executeQuery\s*\("),
+                ],
+                "safe": [
+                    re.compile(r"try\s*\(.*\)\s*\{"),
+                    re.compile(r"try-with-resources"),
+                    re.compile(r"DataSource"),
+                    re.compile(r"\.close\s*\(\s*\)"),
+                ],
+                "remediation": "使用 try-with-resources 自动关闭资源，或使用连接池管理",
+            },
+            "python": {
+                "risk": [
+                    re.compile(r"open\s*\([^)]+\)"),
+                    re.compile(r"\.connect\s*\(\s*\)"),
+                ],
+                "safe": [
+                    re.compile(r"with\s+open\s*\("),
+                    re.compile(r"contextlib\.closing"),
+                ],
+                "remediation": "使用 with 语句确保资源自动关闭",
+            },
+        },
+    },
 }
 
 

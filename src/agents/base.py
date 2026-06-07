@@ -218,6 +218,25 @@ class BaseAgent:
         """
         tool_name = step.get("tool_name", "")
         arguments = step.get("arguments", {}) or {}
+        
+        # 工具别名映射：处理 LLM 可能使用的不同工具名称
+        _tool_aliases = {
+            "search": "ripgrep_search",
+            "grep": "ripgrep_search",
+            "find": "ripgrep_search",
+            "read": "read_file",
+            "cat": "read_file",
+            "list": "list_files",
+            "ls": "list_files",
+        }
+        if tool_name in _tool_aliases:
+            original_name = tool_name
+            tool_name = _tool_aliases[tool_name]
+            self._publish_log(
+                "INFO",
+                f"[{self._agent_tag}] 工具别名映射: {original_name!r} -> {tool_name!r}"
+            )
+        
         if not tool_name:
             self._publish_log("WARNING", f"[{self._agent_tag}] tool_call 缺少 tool_name")
             conversation.append({
@@ -231,12 +250,69 @@ class BaseAgent:
         if tool_name == "code_agent":
             return self._run_code_agent(tool_name, arguments, event_span)
 
+        # 定义工具必需参数的校验规则
+        _required_params = {
+            "read_file": ["file_path", "path", "filepath"],
+            "read_lines": ["file_path", "path", "filepath"],
+            "ripgrep_search": ["pattern"],
+            "ripgrep": ["pattern"],
+        }
+        
+        # 检查必需参数
+        required_keys = _required_params.get(tool_name, [])
+        if required_keys:
+            has_required = any(key in arguments for key in required_keys)
+            if not has_required:
+                self._publish_log(
+                    "WARNING",
+                    f"[{self._agent_tag}] 工具 {tool_name!r} 缺少必需参数 {required_keys!r}"
+                )
+                conversation.append({
+                    "role": "user",
+                    "content": json.dumps({
+                        "error": "MISSING_REQUIRED_PARAM",
+                        "tool_name": tool_name,
+                        "required": required_keys,
+                        "requirement": f"调用 {tool_name} 时必须提供 {'或'.join(required_keys)} 参数",
+                    }, ensure_ascii=False),
+                })
+                return None
+
         # 只缓存只读工具（read_file / read_lines / ripgrep / search / list）
         _cacheable_prefixes = ("read_", "readlines", "ripgrep", "search", "list_")
         _cache_key = None
         if tool_name.startswith(_cacheable_prefixes) and isinstance(arguments, dict):
-            _cache_key = f"{tool_name}:{hash(frozenset((k, str(v)) for k, v in sorted(arguments.items())))}"
-            if _cache_key in self._tool_cache:
+            # 增强缓存 key 策略：
+            # - read_file: 按文件路径去重（同一文件只读一次）
+            # - read_lines: 按文件路径去重（如果已有 read_file 缓存则复用）
+            # - ripgrep: 按 pattern + path 去重
+            # - 其他: 按完整参数去重
+            if tool_name == "read_file":
+                file_path = arguments.get("path", arguments.get("file_path", ""))
+                if file_path:
+                    _cache_key = f"read_file:{file_path}"
+            elif tool_name == "read_lines":
+                file_path = arguments.get("path", arguments.get("file_path", ""))
+                if file_path:
+                    # 先查 read_file 的缓存（整个文件）
+                    _full_file_key = f"read_file:{file_path}"
+                    if _full_file_key in self._tool_cache:
+                        self._tool_cache_hits += 1
+                        cached = self._tool_cache[_full_file_key]
+                        self._tool_cache.move_to_end(_full_file_key)
+                        logger.debug("[%s] 工具缓存命中(read_file→read_lines) %s", self._agent_tag, file_path)
+                        return cached
+                    # 再查 read_lines 自身的缓存
+                    _cache_key = f"read_lines:{file_path}"
+            elif tool_name == "ripgrep":
+                pattern = arguments.get("pattern", "")
+                path = arguments.get("path", arguments.get("directory", ""))
+                if pattern:
+                    _cache_key = f"ripgrep:{path}:{pattern}"
+            else:
+                _cache_key = f"{tool_name}:{hash(frozenset((k, str(v)) for k, v in sorted(arguments.items())))}"
+
+            if _cache_key and _cache_key in self._tool_cache:
                 self._tool_cache_hits += 1
                 cached = self._tool_cache[_cache_key]
                 # move to end (LRU)

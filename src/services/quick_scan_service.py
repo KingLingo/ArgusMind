@@ -210,6 +210,13 @@ _REMEDIATION_ADVICE: Dict[str, str] = {
     "WEAK_HASH": "使用SHA-256+等强哈希算法，加盐处理",
     "HARD_CODE_PASSWORD": "使用配置文件或密钥管理服务存储密码",
     "COMPONENT_VULNERABILITY": "升级组件到安全版本",
+    "PLAINTEXT_TRANSMISSION": "使用 HTTPS/TLS 加密传输敏感数据",
+    "MISSING_AUTHENTICATION": "为敏感端点添加认证中间件或注解",
+    "MISSING_ACCESS_CONTROL": "添加基于角色的访问控制检查",
+    "RESOURCE_LEAK": "使用 try-with-resources 或 with 语句确保资源关闭",
+    "RACE_CONDITION": "使用锁机制或数据库事务隔离级别控制并发",
+    "SESSION_FIXATION": "登录后调用 session.invalidate() 并重新创建会话",
+    "PREDICTABLE_RANDOM": "使用 SecureRandom 或 secrets 模块替代 Random/Math.random",
 }
 
 
@@ -237,6 +244,10 @@ _VULN_TYPE_CN_TO_EN: Dict[str, str] = {
     "缓冲区溢出": "BUFFER_OVERFLOW",
     "CSRF": "CSRF",
     "命令执行": "COMMAND_INJECTION",
+    "明文传输": "PLAINTEXT_TRANSMISSION",
+    "资源泄漏": "RESOURCE_LEAK",
+    "缺失认证": "MISSING_AUTHENTICATION",
+    "缺失访问控制": "MISSING_ACCESS_CONTROL",
 }
 
 def _build_quick_scan_patterns() -> Dict[str, List[Dict[str, Any]]]:
@@ -475,12 +486,18 @@ class QuickScanService:
         self._scanned_files: int = 0
         self._total_findings: int = 0
         self._comment_parser = CodeCommentParser()
+        self._file_content_cache: Dict[str, str] = {}
 
     def reset(self) -> None:
         """重置扫描状态。"""
         self._vuln_id_gen.reset()
         self._scanned_files = 0
         self._total_findings = 0
+        self._file_content_cache.clear()
+
+    def get_file_content_cache(self) -> Dict[str, str]:
+        """返回已缓存的文件内容（file_path → content），供下游 PatternAnalyzer 复用。"""
+        return dict(self._file_content_cache)
 
     def get_stats(self) -> Dict[str, Any]:
         """获取扫描统计。"""
@@ -512,6 +529,7 @@ class QuickScanService:
         except (OSError, IOError):
             return []
 
+        self._file_content_cache[file_path] = content
         lines = content.split("\n")
         # 合并语言特定规则 + 通用规则（通用规则只编译一份，按需合并）
         lang_patterns = self._lang_patterns.get(language, [])
@@ -839,7 +857,10 @@ class QuickScanService:
         # 组件漏洞扫描
         component_findings = self.scan_component_vulns(project_root)
 
-        combined = active_findings + component_findings
+        # 配置文件扫描（yml/yaml/xml/properties 中的硬编码凭据）
+        config_findings = self._scan_config_files(project_root, file_list)
+
+        combined = active_findings + component_findings + config_findings
 
         return {
             "findings": combined,
@@ -873,6 +894,73 @@ class QuickScanService:
                 rel_path = os.path.relpath(abs_path, project_root).replace("\\", "/")
                 files.append(rel_path)
         return files
+
+    def _scan_config_files(
+        self, project_root: str, file_list: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """扫描配置文件（yml/yaml/xml/properties）中的硬编码凭据和敏感信息。"""
+        findings: List[Dict[str, Any]] = []
+        config_exts = {".yml", ".yaml", ".xml", ".properties", ".conf", ".cfg", ".ini", ".toml", ".env"}
+
+        # 硬编码凭据检测模式
+        credential_patterns = [
+            (re.compile(r'(?:password|passwd|pwd|secret|api[_-]?key|token|private[_-]?key)\s*[:=]\s*["\']?([^"\'&\s]{8,})["\']?', re.IGNORECASE), "HARDCODED_CREDENTIALS"),
+            (re.compile(r'(?:jdbc:|mysql:|postgresql:|mongodb:|redis:)[^"\'\s]*//[^:@]+:([^@"\'\s]+)@', re.IGNORECASE), "HARDCODED_CREDENTIALS"),
+            (re.compile(r'(?:username|user)\s*[:=]\s*["\']?(admin|root|sa)["\']?', re.IGNORECASE), "WEAK_PASSWORD_POLICY"),
+        ]
+
+        for rel_path in (file_list or self._collect_files(project_root)):
+            ext = os.path.splitext(rel_path)[1].lower()
+            if ext not in config_exts:
+                continue
+
+            abs_path = os.path.join(project_root, rel_path)
+            if not os.path.isfile(abs_path):
+                continue
+
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            # 跳过明显的示例/模板文件
+            if "example" in rel_path.lower() or "sample" in rel_path.lower() or "template" in rel_path.lower():
+                continue
+
+            lines = content.split("\n")
+            for line_idx, line_content in enumerate(lines):
+                # 跳过空行和注释行
+                stripped = line_content.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("<!--"):
+                    continue
+
+                for pattern, vuln_type in credential_patterns:
+                    match = pattern.search(stripped)
+                    if match:
+                        credential_value = match.group(1) if match.lastindex else ""
+                        # 跳过明显的占位符值
+                        if credential_value and any(x in credential_value.lower() for x in ("your_", "changeme", "xxx", "***", "placeholder", "example")):
+                            continue
+
+                        findings.append({
+                            "source": "quick_scan",
+                            "vuln_type": vuln_type,
+                            "title": f"配置文件 {os.path.basename(rel_path)} 中发现硬编码凭据",
+                            "severity": "H",
+                            "confidence": 0.85,
+                            "location": f"{rel_path}:{line_idx + 1}",
+                            "file": rel_path,
+                            "line": line_idx + 1,
+                            "cwe": "CWE-798" if "CREDENTIALS" in vuln_type else "CWE-521",
+                            "language": ext.strip("."),
+                            "evidence": f"{stripped[:200]}",
+                            "impact": f"配置文件 {rel_path}:{line_idx + 1} 包含敏感凭据，可能导致未授权访问",
+                            "remediation": "将敏感凭据移到环境变量或密钥管理服务中，不要硬编码在配置文件中",
+                        })
+                        break  # 一行只报告一次
+
+        return findings
 
     @staticmethod
     def _extract_snippet(lines: List[str], line_idx: int, context: int = 4) -> str:

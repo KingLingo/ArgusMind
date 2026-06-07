@@ -74,7 +74,7 @@ class EventPageResult(BaseModel):
 class HumanApprovalDecisionRequest(BaseModel):
     approved: bool = True
     operator: str = Field(default="user", max_length=64)
-    message: Optional[str] = Field(default=None, max_length=10000)
+    message: Optional[str] = Field(default=None, max_length=50000)
 
 
 class HumanApprovalDecisionRead(BaseModel):

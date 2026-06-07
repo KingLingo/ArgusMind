@@ -67,6 +67,7 @@ def list_findings(
     keyword: Optional[str] = Query(None),
     severity: Optional[str] = Query(None, description="与主表 level 匹配（大小写不敏感）"),
     status: Optional[str] = Query(None),
+    source: Optional[str] = Query(None, description="来源过滤"),
     page: Pagination = Depends(pagination),
 ) -> PageResult[FindingListItem]:
     flt = FindingFilter(
@@ -75,9 +76,69 @@ def list_findings(
         keyword=keyword,
         severity=severity,
         status=status,
+        source=source,
     )
     rows, total = vulnerability_service.list_findings(flt, current=page.current, page_size=page.page_size)
     return PageResult[FindingListItem](data=[FindingListItem.model_validate(r) for r in rows], total=total)
+
+
+@router.get("/export", summary="导出漏洞列表为 Excel")
+def export_findings(
+    project_id: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+    keyword: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+):
+    from io import BytesIO
+    from openpyxl import Workbook
+
+    from src.repositories.vulnerability_repository import VulnerabilityRepository
+    from src.infrastructure.db import session_scope
+    from src.infrastructure.db.models import Vulnerability, VulnerabilityDetail
+
+    flt = FindingFilter(
+        project_id=project_id,
+        task_id=task_id,
+        keyword=keyword,
+        severity=severity,
+        status=status,
+        source=source,
+    )
+    with session_scope() as session:
+        rows, _ = VulnerabilityRepository(session).list(
+            project_id=flt.project_id,
+            task_id=flt.task_id,
+            keyword=flt.keyword,
+            severity=flt.severity,
+            status=flt.status,
+            source=flt.source,
+            current=1,
+            page_size=100000,
+        )
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "漏洞列表"
+        ws.append(["ID", "漏洞名称", "等级", "判定", "来源", "状态", "二次校验", "置信度", "文件位置", "CWE", "创建时间"])
+        for r in rows:
+            ep = str(getattr(r.detail, "entry_points", "")) if r.detail else ""
+            cwe = str(getattr(r.detail, "cwe", "")) if r.detail else ""
+            ws.append([
+                r.id, r.vul_name, r.level, r.verdict, r.source, r.status,
+                r.verification_status, r.confidence, ep, cwe,
+                r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+            ])
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+    from fastapi.responses import Response
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=vulnerabilities.xlsx"},
+    )
 
 
 @router.get(

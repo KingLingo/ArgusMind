@@ -342,6 +342,61 @@ QUICK_GREP_RULES: Dict[str, List[Dict[str, str]]] = {
         {"pattern": r"price|amount|total|balance.*=.*request\.", "description": "客户端控制金额"},
         {"pattern": r"status\s*=\s*request\.", "description": "客户端控制状态"},
     ],
+    # ── 新增：无需 sink 点即可检测的漏洞模式 ──
+    "weak_crypto": [
+        {"pattern": r"(?i)DES\.|DESede\.|RC4\.|MD5\.getInstance|SHA1\.getInstance", "description": "弱加密算法"},
+        {"pattern": r"(?i)Cipher\.getInstance\(\s*\"DES", "description": "DES 弱加密"},
+        {"pattern": r"(?i)Cipher\.getInstance\(\s*\".*/(ECB|CBC)/PKCS5Padding", "description": "ECB 模式不安全的加密"},
+        {"pattern": r"(?i)SecretKeySpec\(.*\"DES\"", "description": "DES 密钥规范"},
+        {"pattern": r"(?i)MessageDigest\.getInstance\(\"MD5\"", "description": "MD5 弱哈希"},
+        {"pattern": r"(?i)MessageDigest\.getInstance\(\"SHA-1\"", "description": "SHA-1 弱哈希"},
+    ],
+    "hardcoded_secrets": [
+        {"pattern": r"(?i)password\s*=\s*['\"][^'\"]{3,}['\"]", "description": "硬编码密码"},
+        {"pattern": r"(?i)secret\s*=\s*['\"][^'\"]{8,}['\"]", "description": "硬编码密钥"},
+        {"pattern": r"(?i)api_key\s*=\s*['\"][^'\"]{8,}['\"]", "description": "硬编码 API Key"},
+        {"pattern": r"(?i)apiKey\s*=\s*['\"][^'\"]{8,}['\"]", "description": "硬编码 API Key"},
+        {"pattern": r"(?i)token\s*=\s*['\"][A-Za-z0-9_\-\.]{20,}['\"]", "description": "硬编码 Token"},
+        {"pattern": r"(?i)access_key\s*=\s*['\"][^'\"]{10,}['\"]", "description": "硬编码访问密钥"},
+        {"pattern": r"(?i)private_key\s*=\s*['\"][^'\"]{10,}['\"]", "description": "硬编码私钥"},
+        {"pattern": r"(?i)(-----BEGIN RSA PRIVATE KEY-----|-----BEGIN EC PRIVATE KEY-----)", "description": "硬编码私钥块"},
+    ],
+    "weak_hash": [
+        {"pattern": r"(?i)hashlib\.md5|hashlib\.sha1", "description": "Python 弱哈希"},
+        {"pattern": r"(?i)md5\(|sha1\(", "description": "PHP/JS 弱哈希"},
+        {"pattern": r"(?i)password_hash\s*\(\s*[^,]+,\s*PASSWORD_DEFAULT", "description": "安全哈希（确认配置正确）"},
+    ],
+    "insecure_random": [
+        {"pattern": r"(?i)Random\(\)\.next|Math\.random\(\)", "description": "不安全的随机数生成"},
+        {"pattern": r"(?i)new Random\(\)", "description": "非密码学安全的随机数"},
+    ],
+    "log_injection": [
+        {"pattern": r"(?i)logger\.(error|warn|info|debug)\(.*\.(replace|replaceAll).*\n", "description": "日志注入（未转义换行符）"},
+        {"pattern": r"(?i)log\.(error|warn|info)\(.*request", "description": "日志记录用户输入"},
+    ],
+    "race_condition": [
+        {"pattern": r"(?i)synchronized\s*\(.*\)\s*\{", "description": "同步块（需检查竞态条件）"},
+        {"pattern": r"(?i)@Transactional.*\n.*(read|write|update|delete)", "description": "事务操作（需检查竞态）"},
+        {"pattern": r"(?i)check.*exist.*if.*!.*exist.*create", "description": "TOCTOU 模式：检查与创建非原子操作"},
+    ],
+    "jwt_vulnerabilities": [
+        {"pattern": r"(?i)jwt\.verify|jwt\.sign", "description": "JWT 操作（需检查算法配置）"},
+        {"pattern": r"(?i)\.decode\(.*,.*options.*verify.*false", "description": "JWT 未验证签名"},
+        {"pattern": r"(?i)algorithm:\s*['\"]none['\"]", "description": "JWT none 算法"},
+    ],
+    "open_redirect": [
+        {"pattern": r"(?i)redirect\(.*request\.|sendRedirect\(.*request\.", "description": "开放重定向"},
+        {"pattern": r"(?i)header\(\s*['\"]Location['\"]\s*,\s*\$_(GET|POST|REQUEST)", "description": "基于用户输入的 Location 头"},
+    ],
+    "csrf": [
+        {"pattern": r"(?i)@CrossOrigin\s*\(\s*origins\s*=\s*['\"]\*['\"]", "description": "CORS 开放所有源"},
+        {"pattern": r"(?i)\.allowCredentials\(\s*true\s*\).*\.allowedOrigins\(\s*['\"]\*['\"]", "description": "凭据+通配符源（危险）"},
+    ],
+    "information_disclosure": [
+        {"pattern": r"(?i)stack_trace|printStackTrace|dumpStack", "description": "堆栈跟踪泄露"},
+        {"pattern": r"(?i)debug\s*=\s*true|show_exceptions\s*=\s*true", "description": "调试模式开启"},
+        {"pattern": r"(?i)\.env|DB_PASSWORD|DB_USERNAME|SECRET_KEY", "description": "环境变量中的敏感信息"},
+    ],
 }
 
 

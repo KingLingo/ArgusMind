@@ -19,6 +19,7 @@ class Task(Base):
     project_id: Mapped[str] = mapped_column(String(64), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     offline_mode: Mapped[bool] = mapped_column(default=False, nullable=False)
+    enable_sink_finder: Mapped[bool] = mapped_column(default=False, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     todo: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSONB, default=list, nullable=True)
     error: Mapped[str] = mapped_column(Text, default="", nullable=False)

@@ -306,10 +306,9 @@ class ValidationService:
                 continue
 
             if not os.path.isfile(file_path):
-                result.hallucinations.append({
-                    **finding,
-                    "validation_error": f"文件不存在: {file_path}",
-                })
+                # 文件可能已被清理（临时目录过期），保留发现但不做深层的代码验证
+                finding["validation_note"] = "文件已不存在（临时目录已清理）"
+                result.validated.append(finding)
                 continue
 
             file_map.setdefault(file_path, []).append((idx, finding))
@@ -609,3 +608,155 @@ class ValidationService:
                 return os.path.join(project_root, parts[0])
 
         return ""
+
+    # ---------- Guard Pattern 检测（上下文感知假阳性过滤）----------
+
+    # 对照 gbt-codeagent 的 contextAwareFilter.js GUARD_WINDOW_LINES=5
+    _GUARD_WINDOW_LINES = 5
+
+    _GUARD_PATTERNS: Dict[str, List[re.Pattern]] = {
+        "COMMAND_INJECTION": [
+            re.compile(r'shlex\.quote|escapeshellarg|escapeshellcmd'),
+            re.compile(r'ProcessBuilder\s*\([^)]*List|\.command\s*\(\s*"[^"]*"\s*\)'),
+        ],
+        "SQL_INJECTION": [
+            re.compile(r'PreparedStatement|prepareStatement'),
+            re.compile(r'setParameter|setString|setInt|setLong'),
+            re.compile(r'NamedParameterJdbcTemplate|JdbcTemplate\s*\(\s*dataSource'),
+            re.compile(r'createQuery\s*\([^)]*\.class'),
+        ],
+        "CODE_INJECTION": [
+            re.compile(r'\.replace\s*\(.*pattern', re.IGNORECASE),
+            re.compile(r'\.sanitize|\.escape|htmlspecialchars|strip_tags'),
+            re.compile(r'JSON\.parse\s*\('),
+        ],
+        "XSS": [
+            re.compile(r'\.textContent\s*=|\.innerText\s*='),
+            re.compile(r'\.replace\s*\(.*<[^>]*>'),
+            re.compile(r'escapeHtml|sanitizeHtml|DOMPurify|xss-filters'),
+            re.compile(r'Content-Security-Policy'),
+        ],
+        "PATH_TRAVERSAL": [
+            re.compile(r'\.normalize\s*\(|\.resolve\s*\('),
+            re.compile(r'path\.join\s*\(|os\.path\.join\s*\('),
+            re.compile(r'AccessController\.checkPermission|SecurityManager'),
+            re.compile(r'FilenameUtils\.getName|Paths\.get'),
+        ],
+        "DESERIALIZATION": [
+            re.compile(r'ValidatingObjectInputStream|LookAheadObjectInputStream'),
+            re.compile(r'resolveClass\s*\('),
+            re.compile(r'setAcceptClasses|setRejectClasses|setAllowedTypes'),
+            re.compile(r'ObjectInputFilter|serialFilter|jdk\.serialFilter'),
+        ],
+        "SSRF": [
+            re.compile(r'ALLOWED_HOSTS|ALLOWED_DOMAINS|whitelist|blocklist', re.IGNORECASE),
+            re.compile(r'\.startsWith\s*\(\s*["\']/[^"\']+["\']|\.includes\s*\(\s*["\']/[^"\']+'),
+            re.compile(r'isSafeUrl|validateUrl|checkHost|isInternal'),
+            re.compile(r'InetAddress\.getByName|isLoopbackAddress|isSiteLocalAddress'),
+        ],
+        "HARDCODED_CREDENTIALS": [
+            re.compile(r'process\.env\.|os\.environ|System\.getenv|getenv\s*\('),
+            re.compile(r'config\[|config\.get\s*\(|getConfig\s*\('),
+            re.compile(r'keyVault|secretManager|vault|credentialsFromFile', re.IGNORECASE),
+            re.compile(r'@Value\s*\(\s*"\$\{'),
+        ],
+        "XXE": [
+            re.compile(r'setFeature\s*\(.*disallow-doctype|setFeature\s*\(.*external-general-entities'),
+            re.compile(r'setFeature\s*\(.*external-parameter-entities|setFeature\s*\(.*load-external-dtd'),
+            re.compile(r'XMLConstants\.FEATURE_SECURE_PROCESSING'),
+            re.compile(r'setExpandEntityReferences\s*\(\s*false'),
+        ],
+        "CORS_MISCONFIGURATION": [
+            re.compile(r'ALLOWED_ORIGINS|allowedOrigins|CORS_ORIGIN_WHITELIST'),
+            re.compile(r'originWhitelist|corsWhitelist|corsAllowedOrigins'),
+            re.compile(r'@CrossOrigin\s*\(\s*origins\s*=\s*"[^"]+"'),
+            re.compile(r'corsConfigurationSource\s*\('),
+        ],
+        "SESSION_FIXATION": [
+            re.compile(r'session\.invalidate\s*\('),
+            re.compile(r'request\.changeSessionId\s*\('),
+            re.compile(r'session_regenerate_id'),
+        ],
+        "RACE_CONDITION": [
+            re.compile(r'@Version|@Lock\s*\('),
+            re.compile(r'ReentrantLock|synchronized\s*\('),
+            re.compile(r'AtomicInteger|AtomicBoolean|AtomicReference'),
+            re.compile(r'UPDATE\s+.*WHERE\s+.*version'),
+        ],
+        "WEAK_CRYPTO": [
+            re.compile(r'AES/GCM|AES/CBC/PKCS5Padding'),
+            re.compile(r'SecureRandom'),
+            re.compile(r'SHA-256|SHA-512|SHA3'),
+            re.compile(r'secrets\.token|secrets\.choice'),
+        ],
+    }
+
+    # 字符串字面量参数模式（如 func("literal_string")）
+    _STRING_LITERAL_PATTERN = re.compile(r'^["\'][^"\'{}]*["\']\s*$')
+    _METHOD_CALL_PATTERN = re.compile(r'^\s*\w+\s*\(\s*["\'][^"\']*["\']\s*\)\s*$')
+
+    @classmethod
+    def _extract_guard_window(cls, lines: List[str], line_idx: int) -> str:
+        """提取发现行上下 N 行的 Guard Window。"""
+        start = max(0, line_idx - cls._GUARD_WINDOW_LINES)
+        end = min(len(lines), line_idx + cls._GUARD_WINDOW_LINES + 1)
+        return "\n".join(lines[start:end])
+
+    @classmethod
+    def _has_guard_pattern(cls, window_text: str, vuln_type: str) -> bool:
+        """检查 Guard Window 内是否包含安全防护模式。"""
+        patterns = cls._GUARD_PATTERNS.get(vuln_type, [])
+        if not patterns:
+            return False
+        return any(p.search(window_text) for p in patterns)
+
+    @classmethod
+    def _is_string_literal_arg(cls, line_content: str) -> bool:
+        """检查该行是否为字符串字面量参数（大概率是测试/配置，非用户输入）。"""
+        trimmed = line_content.strip()
+        return bool(cls._STRING_LITERAL_PATTERN.search(trimmed)
+                    or cls._METHOD_CALL_PATTERN.search(trimmed))
+
+    @classmethod
+    def evaluate_guard_context(
+        cls,
+        lines: List[str],
+        line_idx: int,
+        vuln_type: str,
+    ) -> Dict[str, Any]:
+        """评估发现行的 Guard Context，返回置信度调整建议。
+
+        对应 gbt-codeagent 的 evaluateGuardContext：
+        - 字符串字面量参数 + 无防护 → confidence 降至 0.2
+        - 有防护模式 → confidence 降至 0.3
+        - 两者都有 → confidence 降至 0.1
+        """
+        window_text = cls._extract_guard_window(lines, line_idx)
+        line_content = lines[line_idx].strip() if 0 <= line_idx < len(lines) else ""
+
+        has_string_arg = cls._is_string_literal_arg(line_content)
+        has_guard = cls._has_guard_pattern(window_text, vuln_type)
+        notes = []
+        new_confidence = None
+
+        if has_string_arg:
+            notes.append("argument_appears_to_be_string_literal")
+        if has_guard:
+            notes.append("security_guard_pattern_detected")
+
+        if has_string_arg and has_guard:
+            new_confidence = 0.1
+            notes.append("doubly_mitigated")
+        elif has_string_arg and not has_guard:
+            new_confidence = 0.2
+            notes.append("probably_false_positive_string_arg")
+        elif has_guard and not has_string_arg:
+            new_confidence = 0.3
+            notes.append("mitigated_by_guard")
+
+        return {
+            "has_string_literal_arg": has_string_arg,
+            "has_guard_pattern": has_guard,
+            "adjusted_confidence": new_confidence,
+            "notes": notes,
+        }

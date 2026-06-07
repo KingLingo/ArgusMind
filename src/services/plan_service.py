@@ -144,6 +144,55 @@ def fetch_all_pending_risk_categories(lang_node_id: str) -> List[Dict[str, Any]]
     return [r.data() for r in records]
 
 
+def fetch_all_pending_risk_categories_global(plan_stage_node_id: str) -> List[Dict[str, Any]]:
+    """
+    跨语言一次性查出指定计划下所有 status=pending 的 RiskCategory，
+    按优先级（level 升序）全局排序，供按优先级调度使用。
+
+    返回每项额外包含 language_name 和 lang_node_id，便于回溯语言信息。
+    """
+    repo = db_manager.neo4j_repository
+    if repo is None:
+        return []
+    cypher = """
+    MATCH (plan:AuditStage {node_id: $plan_id})-[:HAS_LANGUAGE]->(lang:Language)
+          -[:HAS_RISK_CATEGORY]->(cat:RiskCategory)
+    WHERE cat.status = 'pending'
+    RETURN cat.node_id AS node_id,
+           cat.category_name AS category_name,
+           cat.risk_description AS risk_description,
+           cat.reasoning_basis AS reasoning_basis,
+           cat.level AS level,
+           cat.status AS status,
+           cat.task_id AS task_id,
+           coalesce(cat.sink_finder_completed, false) AS sink_finder_completed,
+           lang.name AS language_name,
+           lang.node_id AS lang_node_id,
+           lang.level AS lang_level
+    ORDER BY coalesce(toInteger(cat.level), 999999) ASC,
+             coalesce(toInteger(lang.level), 999999) ASC,
+             cat.node_id ASC
+    """
+    records = repo.client.execute_read(cypher, {"plan_id": plan_stage_node_id})
+    return [r.data() for r in records]
+
+
+def check_language_all_categories_completed(lang_node_id: str) -> bool:
+    """检查指定语言下是否所有 RiskCategory 都已完成（非 pending/running）。"""
+    repo = db_manager.neo4j_repository
+    if repo is None:
+        return True
+    cypher = """
+    MATCH (lang:Language {node_id: $lang_node_id})-[:HAS_RISK_CATEGORY]->(cat:RiskCategory)
+    WHERE cat.status IN ['pending', 'running']
+    RETURN count(cat) AS remaining
+    """
+    records = repo.client.execute_read(cypher, {"lang_node_id": lang_node_id})
+    if not records:
+        return True
+    return int(records[0].data().get("remaining", 0)) == 0
+
+
 def reset_running_audit_nodes_to_pending_for_task(task_id: str) -> int:
     """
     将指定 task 下审计编排节点（Language、RiskCategory、SinkFlowNode、
@@ -216,7 +265,7 @@ def fetch_task_language_risk_status(task_id: str) -> Dict[str, Any]:
     ORDER BY coalesce(toInteger(lang.level), 999999) ASC, lang.node_id ASC,
              coalesce(toInteger(cat.level), 999999) ASC, cat.node_id ASC
     """
-    records = repo.client.execute_write(cypher, {"task_id": tid})
+    records = repo.client.execute_read(cypher, {"task_id": tid})
     if not records:
         return empty
 

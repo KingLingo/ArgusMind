@@ -543,7 +543,8 @@ class ChainAnalyzer(BaseAgent):
         all_results: List[Dict[str, Any]] = []
         consecutive_invalid_action = 0
         consecutive_tool_only = 0
-        max_tool_only = 12
+        consecutive_no_discovery = 0
+        max_tool_only = 8  # 从 12 降到 8，尽早退出无进展探测
         info_span = start_event_span(
             task_id=self._brain.task_id,
             module=self.MODULE_NAME,
@@ -584,6 +585,7 @@ class ChainAnalyzer(BaseAgent):
                 "insert_node",
                 "record_info",
                 "final_resolution",
+                "neo4j_update_node",
             ):
                 consecutive_invalid_action = 0
 
@@ -661,6 +663,50 @@ class ChainAnalyzer(BaseAgent):
                     return all_results
                 continue
             logger.debug("[ChainAnalyzer] step=%s", json.dumps(step, ensure_ascii=False))
+
+            # --- neo4j_update_node (LLM 误将工具名写为 action，统一为 tool_call) ---
+            if action == "neo4j_update_node":
+                step["tool_name"] = "neo4j_update_node"
+                step["arguments"] = {"node_spec": step.get("node_spec", {}), "updates": step.get("updates", {})}
+                self._publish_log(
+                    "INFO",
+                    f"[ChainAnalyzer] 处理 neo4j_update_node (重映射为 tool_call) | branch_id={branch_id or '(root)'}",
+                )
+                tool_span = start_event_span(
+                    task_id=self._brain.task_id,
+                    module=self.MODULE_NAME,
+                    action_type=ActionType.TOOL_CALL,
+                    tool_name="neo4j_update_node",
+                    reason=thought,
+                    tool_arguments=step["arguments"],
+                )
+                tool_span.add_llm_tokens(input_tokens, output_tokens)
+                tool_result = self._execute_tool_call(step, conversation, tool_span)
+                if tool_result is not None:
+                    conversation.append({
+                        "role": "user",
+                        "content": json.dumps({
+                            "status": "TOOL_RESULT",
+                            "tool_name": "neo4j_update_node",
+                            "result": tool_result,
+                        }, ensure_ascii=False, default=str),
+                    })
+                else:
+                    conversation.append({
+                        "role": "user",
+                        "content": json.dumps({
+                            "status": "TOOL_RESULT_NONE",
+                            "tool_name": "neo4j_update_node",
+                            "result": "neo4j_update_node 工具调用未返回结果",
+                        }, ensure_ascii=False, default=str),
+                    })
+                tool_span.set_output(
+                    tool_result if isinstance(tool_result, str) else json.dumps(tool_result, ensure_ascii=False, default=str)
+                )
+                tool_span.finish()
+                consecutive_tool_only += 1
+                continue
+
             # --- fork ---
             if action == "fork":
                 branches_data = step.get("branches", [])
@@ -1027,7 +1073,7 @@ class ChainAnalyzer(BaseAgent):
 
             if existing_cn:
                 existing_node_id = str(existing_cn.get("node_id") or "").strip()
-                start_event_span(
+                _info_span = start_event_span(
                     task_id=self._brain.task_id,
                     module=self.MODULE_NAME,
                     action_type=ActionType.INFORMATION,
@@ -1036,6 +1082,7 @@ class ChainAnalyzer(BaseAgent):
                         f"type={node_type} | {func_val}({file_val}:{line_val}) | {reason_val}"
                     ),
                 )
+                _info_span.finish()
                 cn_row = merge_existing_chain_node(
                     existing_node_id,
                     new_line=line_val,
@@ -1049,7 +1096,7 @@ class ChainAnalyzer(BaseAgent):
                 if reused_ar_element_id:
                     skip_analysis = True
             else:
-                start_event_span(
+                _info_span = start_event_span(
                     task_id=self._brain.task_id,
                     module=self.MODULE_NAME,
                     action_type=ActionType.INFORMATION,
@@ -1058,6 +1105,7 @@ class ChainAnalyzer(BaseAgent):
                         f"{func_val}({file_val}:{line_val}) | {reason_val}"
                     ),
                 )
+                _info_span.finish()
                 cn_row = create_chain_node(
                     node_type=node_type,
                     branch_id=branch_id,
@@ -1097,7 +1145,7 @@ class ChainAnalyzer(BaseAgent):
             branch_tail = plan["branch_tail"]
             if plan.get("skip_analysis") and plan.get("reused_ar_element_id"):
                 ar_eid = str(plan["reused_ar_element_id"]).strip()
-                start_event_span(
+                _info_span = start_event_span(
                     task_id=self._brain.task_id,
                     module=self.MODULE_NAME,
                     action_type=ActionType.INFORMATION,
@@ -1106,6 +1154,7 @@ class ChainAnalyzer(BaseAgent):
                         f"复用 AR elementId={ar_eid} | node_id={branch_tail.node_id}"
                     ),
                 )
+                _info_span.finish()
                 complete_eids: List[str] = []
                 seen_eids: set = set()
                 for node in sink_nodes:

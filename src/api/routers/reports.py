@@ -92,6 +92,9 @@ def get_report(task_id: str) -> OkResponse[dict]:
             .scalars()
             .all()
         )
+        # 跨源去重（相同 file+type+line 仅保留优先级最高的记录）
+        from src.services.vulnerability_service import deduplicate_findings
+        findings_rows = deduplicate_findings(list(findings_rows))
 
         # 结论聚合
         verdict_counts = dict(
@@ -254,6 +257,9 @@ def regenerate_html_report(task_id: str):
             Vulnerability.task_id == task_id,
             Vulnerability.status != "false_positive",
         ).all()
+        # 跨源去重（相同 file+type+line 仅保留优先级最高的记录）
+        from src.services.vulnerability_service import deduplicate_findings
+        rows = deduplicate_findings(list(rows))
 
         # 预加载所有 detail
         detail_map = {}
@@ -368,8 +374,8 @@ def regenerate_html_report(task_id: str):
                 "evidence_points": entry_points_str.split("\n") if entry_points_str else [],
             })
 
-        quick_scan = [f for f in findings if f.get("source") in ("quick_scan", "component_scan")]
-        llm = [f for f in findings if f.get("source") not in ("quick_scan", "component_scan")]
+        quick_scan = [f for f in findings if f.get("source") in ("quick_scan", "component_scan", "pattern_analyzer", "gapfill", "file_review")]
+        llm = [f for f in findings if f.get("source") not in ("quick_scan", "component_scan", "pattern_analyzer", "gapfill", "file_review")]
 
         # --- audit_score：从 findings 重新计算 ---
         audit_score_result = None

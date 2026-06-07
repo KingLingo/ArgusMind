@@ -14,6 +14,8 @@ class AuditTaskCreate(BaseModel):
     name: str = Field(..., max_length=255)
     offline_mode: bool = Field(False, alias="offlineMode",
                                 description="脱机模式：仅使用规则引擎和快速扫描，不调用 LLM")
+    enable_sink_finder: bool = Field(False, alias="enableSinkFinder",
+                                      description="启用 SinkFinder 深度审计（逐类型搜索危险函数+链路分析，耗时较长）")
 
 
 class TaskUpdate(BaseModel):
@@ -29,6 +31,7 @@ class TaskRead(BaseModel):
     project_id: str
     name: str
     offline_mode: bool = False
+    enable_sink_finder: bool = False
     status: str
     todo: Optional[List[Dict[str, Any]]] = None
     llm_input_token: int = 0

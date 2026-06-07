@@ -92,3 +92,16 @@ class EventRepository:
         )
         result = self.session.execute(stmt)
         return int(result.rowcount or 0)
+
+    def complete_running_by_task(self, task_id: str) -> int:
+        """将 task 下所有 status=running 的事件标为 completed（任务正常结束时兜底清理）。"""
+        stmt = (
+            update(EventRecord)
+            .where(
+                EventRecord.task_id == task_id,
+                EventRecord.status == "running",
+            )
+            .values(status="completed", finished_at=datetime.utcnow())
+        )
+        result = self.session.execute(stmt)
+        return int(result.rowcount or 0)

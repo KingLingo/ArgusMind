@@ -240,6 +240,7 @@ def _ensure_missing_columns(engine, db_name: str) -> None:
     migrations = [
         # (table, column, type_def)
         ("tasks", "offline_mode", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("tasks", "enable_sink_finder", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ("tasks", "vuln_count", "INTEGER NOT NULL DEFAULT 0"),
         # vulnerability_details 新增字段
         ("vulnerability_details", "remediation", "TEXT NOT NULL DEFAULT ''"),

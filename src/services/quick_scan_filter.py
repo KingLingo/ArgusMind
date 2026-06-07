@@ -485,7 +485,7 @@ class QuickScanFilter:
         score = 0
 
         # 1. 严重程度基础分
-        severity = finding.get("severity", finding.get("level", ""))
+        severity = str(finding.get("severity", finding.get("level", ""))).lower()
         score += _SEVERITY_SCORES.get(severity, 2)
 
         # 2. 漏洞类型加分
@@ -503,19 +503,11 @@ class QuickScanFilter:
             if lines:
                 code_content = "\n".join(lines)
                 ext = _detect_extension(file_path)
-                patterns = _SECURITY_HINT_PATTERNS.get(ext, {})
-                for p in patterns.get("input_sources", []):
-                    if p.search(code_content):
-                        hint_score += 3
-                        break
-                for p in patterns.get("dangerous_sinks", []):
-                    if p.search(code_content):
-                        hint_score += 4
-                        break
-                for p in patterns.get("safety_signals", []):
-                    if p.search(code_content):
-                        hint_score -= 2
-                        break
+                from src.services.security_hint_profile import get_security_hint_profile, security_hint_score
+                profile = get_security_hint_profile(code_content, ext)
+                hint_score = security_hint_score(profile)
+                # 将画像也存入缓存，供后续过滤使用
+                finding["_security_profile"] = profile
             self._hint_score_cache[file_path] = hint_score
             score += hint_score
 

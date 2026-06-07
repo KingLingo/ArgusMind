@@ -5,6 +5,7 @@ Plan Agent —— 项目审计计划生成阶段。
 根据项目信息，通过多轮 LLM 对话 + 工具调用，生成审计计划。
 """
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from src.core.enums import ActionType
@@ -141,6 +142,11 @@ class Plan(BaseAgent):
         if knowledge_hint:
             system_content += "\n\n" + knowledge_hint
 
+        # 注入项目规模信息，帮助 LLM 控制漏洞类型数量
+        scale_hint = self._build_scale_hint()
+        if scale_hint:
+            system_content += "\n\n" + scale_hint
+
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": self._brain.project_info},
@@ -189,3 +195,8 @@ class Plan(BaseAgent):
                 parts.append(component_hint)
 
         return "\n".join(parts)
+
+    def _build_scale_hint(self) -> str:
+        """根据项目规模生成漏洞类型数量约束提示。"""
+        # 移除项目文件数限制，让 LLM 自由决定漏洞类型数量
+        return ""

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, List, Optional, Union
@@ -304,6 +305,87 @@ class RipgrepSearchTool(BaseTool):
                 error_code=ERROR_CODE_INVALID_ARGUMENT,
                 meta={"root": str(path)},
             )
+
+        # 简单的正则表达式语法校验
+        try:
+            # 检查是否包含无效的正则表达式语法
+            # 检查常见的语法错误
+            invalid_patterns = [
+                r"\{\d*,(\s|$)",  # 重复操作符后缺少表达式（如 {2,} 后面直接结束）
+                r"\{\s*,",  # { 后面直接是逗号
+                r"\{\,",    # { 和 , 之间没有数字
+                r"\*\*",    # 连续的 *
+                r"\+\+",    # 连续的 +
+                r"\?\?",    # 连续的 ?
+                r"\{\{",    # 连续的 {
+                r"\}\}",    # 连续的 }
+                r"\(\(",    # 连续的 (
+                r"\)\)",    # 连续的 )
+                r"\[\[",    # 连续的 [
+                r"\]\]",    # 连续的 ]
+                r"\|\|",    # 连续的 |
+                r"\(\|",    # (| 无效组合
+                r"\|\)",    # |) 无效组合
+                r"\(\)",    # 空的捕获组
+                r"\[\]",    # 空的字符类
+                r"\{\}",    # 空的重复操作符
+                r"\$\^",    # $^ 无效组合
+                r"\^\$",    # ^$ 无效组合
+            ]
+            for invalid in invalid_patterns:
+                if re.search(invalid, pattern):
+                    return ToolResult(
+                        success=False,
+                        error=f"正则表达式包含无效语法: {pattern}",
+                        error_code=ERROR_CODE_INVALID_ARGUMENT,
+                        meta={"root": str(path)},
+                    )
+            
+            # 检查未闭合的括号
+            open_parens = pattern.count("(")
+            close_parens = pattern.count(")")
+            if open_parens != close_parens:
+                return ToolResult(
+                    success=False,
+                    error=f"正则表达式括号不匹配（{open_parens} 个开括号，{close_parens} 个闭括号）: {pattern}",
+                    error_code=ERROR_CODE_INVALID_ARGUMENT,
+                    meta={"root": str(path)},
+                )
+            
+            # 检查未闭合的方括号
+            open_brackets = pattern.count("[")
+            close_brackets = pattern.count("]")
+            if open_brackets != close_brackets:
+                return ToolResult(
+                    success=False,
+                    error=f"正则表达式方括号不匹配（{open_brackets} 个开方括号，{close_brackets} 个闭方括号）: {pattern}",
+                    error_code=ERROR_CODE_INVALID_ARGUMENT,
+                    meta={"root": str(path)},
+                )
+            
+            # 检查未闭合的花括号
+            open_braces = pattern.count("{")
+            close_braces = pattern.count("}")
+            if open_braces != close_braces:
+                return ToolResult(
+                    success=False,
+                    error=f"正则表达式花括号不匹配（{open_braces} 个开花括号，{close_braces} 个闭花括号）: {pattern}",
+                    error_code=ERROR_CODE_INVALID_ARGUMENT,
+                    meta={"root": str(path)},
+                )
+            
+            # 尝试用 Python 正则解析器验证基本语法
+            re.compile(pattern)
+        except re.error as e:
+            return ToolResult(
+                success=False,
+                error=f"正则表达式语法错误: {e}（模式: {pattern}）",
+                error_code=ERROR_CODE_INVALID_ARGUMENT,
+                meta={"root": str(path)},
+            )
+        except Exception:
+            # 校验过程中的其他异常忽略，让 ripgrep 自己处理
+            pass
 
         globs = _normalize_globs(glob)
         argv: List[str] = ["--json", "--hidden", "--glob=!.git/*"]

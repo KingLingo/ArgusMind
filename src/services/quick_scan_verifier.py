@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.llm.client import LLMClient
@@ -43,11 +45,13 @@ class QuickScanVerifier:
             "need_review": 0,
             "error": 0,
         }
+        self._lock = threading.Lock()
 
     def verify_findings(
         self,
         findings: List[Dict[str, Any]],
         project_info: str = "",
+        max_workers: int = 5,
     ) -> List[Dict[str, Any]]:
         """批量验证快速扫描结果，返回验证后的 findings 列表。
 
@@ -55,18 +59,27 @@ class QuickScanVerifier:
         - verification_status: confirmed / false_positive / need_review
         - verification_reason: LLM 给出的判断理由
         - confidence: 更新后的置信度
+
+        Args:
+            findings: 待验证的发现列表
+            project_info: 项目信息描述
+            max_workers: 并行验证的最大批数（控制 LLM 并发）
         """
         if not findings:
             return []
 
         self._stats["total"] = len(findings)
-        verified: List[Dict[str, Any]] = []
+        batches = [findings[i : i + _MAX_FINDINGS_PER_BATCH]
+                   for i in range(0, len(findings), _MAX_FINDINGS_PER_BATCH)]
 
-        # 分批验证
-        for i in range(0, len(findings), _MAX_FINDINGS_PER_BATCH):
-            batch = findings[i : i + _MAX_FINDINGS_PER_BATCH]
-            batch_result = self._verify_batch(batch, project_info)
-            verified.extend(batch_result)
+        if len(batches) <= 1:
+            # 单批直接串行，避免线程开销
+            verified: List[Dict[str, Any]] = []
+            for batch in batches:
+                verified.extend(self._verify_batch(batch, project_info))
+        else:
+            # 多批并行验证
+            verified = self._verify_batches_parallel(batches, project_info, max_workers)
 
         logger.info(
             "QuickScanVerifier 完成: total=%d confirmed=%d false_positive=%d need_review=%d error=%d",
@@ -76,6 +89,35 @@ class QuickScanVerifier:
             self._stats["need_review"],
             self._stats["error"],
         )
+        return verified
+
+    def _verify_batches_parallel(
+        self,
+        batches: List[List[Dict[str, Any]]],
+        project_info: str,
+        max_workers: int,
+    ) -> List[Dict[str, Any]]:
+        """并行验证多批 findings。"""
+        verified: List[Dict[str, Any]] = []
+        workers = min(max_workers, len(batches))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(self._verify_batch, batch, project_info): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                try:
+                    verified.extend(future.result())
+                except Exception as e:
+                    logger.warning("QuickScanVerifier 批量验证异常: %s", e)
+                    # 异常批全部标记为 need_review
+                    batch = futures[future]
+                    for f in batch:
+                        f["verification_status"] = VERIFIED_NEED_REVIEW
+                        f["verification_reason"] = f"LLM 验证异常: {e}"
+                        verified.append(f)
+                        with self._lock:
+                            self._stats["need_review"] += 1
         return verified
 
     def _verify_batch(
@@ -102,7 +144,8 @@ class QuickScanVerifier:
             for f in batch:
                 f["verification_status"] = VERIFIED_NEED_REVIEW
                 f["verification_reason"] = f"LLM 验证调用失败: {e}"
-                self._stats["need_review"] += 1
+                with self._lock:
+                    self._stats["need_review"] += 1
             return batch
 
         # 解析 LLM 返回的验证结果
@@ -119,13 +162,16 @@ class QuickScanVerifier:
 
             if status in ("confirmed", "true", "yes", "real"):
                 f["verification_status"] = VERIFIED_CONFIRMED
-                self._stats["confirmed"] += 1
+                with self._lock:
+                    self._stats["confirmed"] += 1
             elif status in ("false_positive", "false", "no", "fp", "误报"):
                 f["verification_status"] = VERIFIED_FALSE_POSITIVE
-                self._stats["false_positive"] += 1
+                with self._lock:
+                    self._stats["false_positive"] += 1
             else:
                 f["verification_status"] = VERIFIED_NEED_REVIEW
-                self._stats["need_review"] += 1
+                with self._lock:
+                    self._stats["need_review"] += 1
 
             f["verification_reason"] = reason
             if isinstance(confidence, (int, float)) and 0 <= confidence <= 1:
