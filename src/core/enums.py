@@ -52,6 +52,20 @@ class FindingSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class VerificationStatus(str, Enum):
+    """漏洞验证状态 —— 参考 CodeScan 三态验证机制。
+
+    - UNREVIEWED: 未复核（默认状态）
+    - CONFIRMED: 已确认（代码证据充分，漏洞真实存在）
+    - UNCERTAIN: 不确定（部分证据存在，但可利用性/影响未完全确认）
+    - REJECTED: 已驳回（误报、重复、无法在代码中找到证据）
+    """
+    UNREVIEWED = "unreviewed"
+    CONFIRMED = "confirmed"
+    UNCERTAIN = "uncertain"
+    REJECTED = "rejected"
+
+
 class ToolStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"

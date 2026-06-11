@@ -250,6 +250,60 @@ def retry_task(task_id: str) -> Task:
         return task
 
 
+def rerun_selected_stages(task_id: str, selected_stages: List[str]) -> Task:
+    """选择性重跑指定审计阶段。
+
+    仅允许 completed/failed 状态的任务进行选择性重跑。
+    将任务状态置为 pending，记录要重跑的阶段到 task.stages_to_rerun 字段，
+    由编排层在执行时决定哪些阶段需要重新执行。
+
+    Args:
+        task_id: 任务 ID
+        selected_stages: 要重跑的阶段列表（如 ["sink_discovery", "chain_analysis"]）
+
+    Returns:
+        更新后的 Task 对象
+
+    Raises:
+        TaskNotFound: 任务不存在
+        InvalidTaskState: 任务状态不允许重跑
+        ValueError: 阶段名称无效
+    """
+    from src.core.enums import AuditStage
+
+    valid_stages = {s.value for s in AuditStage}
+    for stage in selected_stages:
+        if stage not in valid_stages:
+            raise ValueError(f"无效的审计阶段: {stage}，有效值: {valid_stages}")
+
+    with session_scope() as session:
+        repo = TaskRepository(session)
+        task = repo.get(task_id)
+        if task is None:
+            raise TaskNotFound(task_id)
+
+        current = TaskStatus(task.status)
+        if current not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            raise InvalidTaskState(
+                f"仅 completed/failed 状态可选择性重跑，当前为 {task.status}"
+            )
+
+        ctrl = get_task_control()
+        ctrl.clear_paused(task_id)
+        ctrl.clear_stopped(task_id)
+
+        task.status = TaskStatus.PENDING.value
+        if task.finished_at is not None:
+            task.finished_at = None
+
+        # 存储待重跑阶段到 stages_to_rerun JSONB 字段
+        task.stages_to_rerun = selected_stages
+
+        repo.update(task)
+        session.expunge(task)
+        return task
+
+
 def add_token_usage(task_id: str, delta: TokenUsagePatch) -> Optional[Task]:
     """经 ``report_token_usage`` 写入账本（无 ``source_event_id`` 时每次插入新行）。
 

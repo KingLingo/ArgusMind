@@ -168,6 +168,8 @@ declare namespace API {
     poc?: string;
     /** Exploitation chain (JSON from engine / Neo4j walk) */
     exploitation_chain?: Record<string, any> | null;
+    /** Reviewed Severity */
+    reviewed_severity?: string;
   };
 
   type FindingRead = {

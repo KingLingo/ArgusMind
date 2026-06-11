@@ -24,18 +24,144 @@ from src.tools.base import ERROR_CODE_CANCELLED
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_messages(conversation: List[Dict[str, str]]) -> None:
+    """清理对话中的无效消息（参考 CodeScan sanitizeMessageHistory）。
+
+    原地修改 conversation，移除：
+    - 空内容的 tool 消息
+    - 孤立的 tool_call（没有对应 tool 结果）
+    - 空内容的非 system 消息
+    """
+    # 1. 收集所有 tool_call_id
+    tool_call_ids = set()
+    for msg in conversation:
+        for tc in msg.get("tool_calls", []):
+            if isinstance(tc, dict) and tc.get("id"):
+                tool_call_ids.add(tc["id"])
+
+    # 2. 移除无效消息
+    to_remove = set()
+    for i, msg in enumerate(conversation):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # 跳过 system 消息
+        if role == "system":
+            continue
+
+        # 空内容的 tool 消息（没有对应 tool_call_id）
+        if role == "tool" and not msg.get("tool_call_id"):
+            to_remove.add(i)
+            continue
+
+        # 空内容的非 system/tool 消息
+        if role in ("user", "assistant") and not content and not msg.get("tool_calls"):
+            to_remove.add(i)
+
+    # 3. 从后往前移除
+    for i in sorted(to_remove, reverse=True):
+        conversation.pop(i)
+
+
+class _ToolResultCache:
+    """增强型工具结果缓存 —— 参考 CodeScan 的缓存机制。
+
+    特性：
+    - LRU 淘汰：超过 max_entries 时淘汰最旧条目
+    - 字节数限制：超过 max_bytes 时淘汰最旧条目
+    - 统计信息：命中率、字节数等
+    """
+
+    def __init__(self, max_entries: int = 200, max_bytes: int = 8 * 1024 * 1024):
+        self._entries: OrderedDict[str, Any] = OrderedDict()
+        self._bytes: OrderedDict[str, int] = OrderedDict()
+        self._total_bytes: int = 0
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: str) -> tuple[Any, bool]:
+        if key in self._entries:
+            self._entries.move_to_end(key)
+            self._bytes.move_to_end(key)
+            self._hits += 1
+            return self._entries[key], True
+        self._misses += 1
+        return None, False
+
+    def put(self, key: str, value: Any) -> None:
+        entry_bytes = len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+        if entry_bytes > self._max_bytes:
+            return
+
+        if key in self._entries:
+            old_bytes = self._bytes.get(key, 0)
+            self._total_bytes -= old_bytes
+        self._entries[key] = value
+        self._bytes[key] = entry_bytes
+        self._total_bytes += entry_bytes
+        self._entries.move_to_end(key)
+        self._bytes.move_to_end(key)
+
+        self._evict()
+
+    def _evict(self) -> None:
+        while (
+            len(self._entries) > self._max_entries
+            or self._total_bytes > self._max_bytes
+        ):
+            if not self._entries:
+                break
+            oldest_key, _ = self._entries.popitem(last=False)
+            oldest_bytes = self._bytes.pop(oldest_key, 0)
+            self._total_bytes -= oldest_bytes
+
+    @property
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "total": total,
+            "hit_rate": round(self._hits / total * 100, 1) if total > 0 else 0.0,
+            "entries": len(self._entries),
+            "total_bytes": self._total_bytes,
+        }
+
+
 class BaseAgent:
     """所有需要 LLM 多轮对话 + 工具调用的 Agent 的公共基类。"""
 
-    _TOOL_CACHE_MAXSIZE = 1024
+    _TOOL_CACHE_MAXSIZE = 200
+    _TOOL_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8MB
 
     def __init__(self, brain: Optional[Brain] = None, max_retries: int = 3):
         self._brain = brain
         self.max_retries = max_retries
-        self._tool_cache: OrderedDict[str, Any] = OrderedDict()
+        self._tool_cache = _ToolResultCache(
+            max_entries=self._TOOL_CACHE_MAXSIZE,
+            max_bytes=self._TOOL_CACHE_MAX_BYTES,
+        )
         self._tool_cache_hits = 0
         self._tool_cache_misses = 0
         self._llm_cached_tokens = 0
+        # 并发去重：正在执行中的工具调用
+        self._pending_tool_calls: dict[str, Any] = {}
+
+    def _get_artifact_store(self):
+        """获取当前任务的 ArtifactStore（懒初始化）。"""
+        if self._brain is None:
+            return None
+        try:
+            store = getattr(self._brain, "_artifact_store", None)
+            if store is None:
+                from src.core.artifact_store import ArtifactStore
+                store = ArtifactStore(self._brain.tmp_dir / "artifacts")
+                self._brain._artifact_store = store
+            return store
+        except Exception:
+            return None
 
     @property
     def _agent_tag(self) -> str:
@@ -139,6 +265,8 @@ class BaseAgent:
             if isinstance(result, dict):
                 content = json.dumps(result, ensure_ascii=False)
                 conversation.append({"role": "assistant", "content": content})
+                # 上下文压力检查：当 prompt_tokens 接近上限时自动压缩
+                self._maybe_compact_conversation(conversation, input_token)
                 return result, input_token, output_token
             self._publish_log(
                 "WARNING",
@@ -178,6 +306,188 @@ class BaseAgent:
             return 0
         return count
 
+    def _maybe_compact_conversation(
+        self,
+        conversation: List[Dict[str, str]],
+        prompt_tokens: int,
+    ) -> None:
+        """根据 ContextCompressionPolicy 检查上下文压力，必要时压缩对话。
+
+        压缩策略：
+        - micro: 仅清理旧工具结果（通过 artifact 占位符替换）
+        - full: 调用 ContextCompressor 做摘要压缩
+        - hard: 强制截断旧消息
+        """
+        from src.core.context_compression import get_compression_policy
+        policy = get_compression_policy()
+        pressure = policy.pressure_level(prompt_tokens)
+        if pressure == "safe":
+            return
+
+        self._publish_log(
+            "INFO",
+            f"[{self._agent_tag}] 上下文压力={pressure}, prompt_tokens={prompt_tokens}, "
+            f"阈值 micro={policy.micro_limit_tokens} full={policy.full_limit_tokens} "
+            f"hard={policy.hard_limit_tokens}",
+        )
+
+        if pressure == "hard":
+            # 硬压缩：保留 system + 最近N条消息
+            min_tail = policy.compact_min_tail_messages
+            if len(conversation) > min_tail + 1:
+                system_msg = conversation[0] if conversation[0].get("role") == "system" else None
+                removed = len(conversation) - min_tail - (1 if system_msg else 0)
+                tail = conversation[-min_tail:]
+                conversation.clear()
+                if system_msg:
+                    conversation.append(system_msg)
+                    conversation.append({
+                        "role": "system",
+                        "content": f"[上下文压缩] 已移除 {removed} 条旧消息以防止超出 token 上限。",
+                    })
+                conversation.extend(tail)
+                self._publish_log("WARNING", f"[{self._agent_tag}] 硬压缩: 移除 {removed} 条旧消息")
+
+        elif pressure == "full":
+            # 全压缩：优先使用 session memory，否则调用 LLM 做摘要
+            try:
+                from src.services.session_memory import SessionMemory
+                session_mem = SessionMemory(
+                    task_id=getattr(self._brain, 'task_id', 'unknown'),
+                    agent_tag=self._agent_tag,
+                )
+
+                # 1. 尝试 session memory 压缩（无需 LLM 调用）
+                session_ctx = session_mem.get_session_context()
+                if session_ctx and len(conversation) > 5:
+                    # 保留 system + 最近 4 条消息 + session memory
+                    system_msg = conversation[0] if conversation[0].get("role") == "system" else None
+                    tail = conversation[-4:]
+                    removed = len(conversation) - len(tail) - (1 if system_msg else 0)
+                    conversation.clear()
+                    if system_msg:
+                        conversation.append(system_msg)
+                    conversation.append({"role": "system", "content": session_ctx})
+                    conversation.extend(tail)
+                    self._inject_evidence_index(conversation)
+                    self._publish_log("INFO",
+                        f"[{self._agent_tag}] Session Memory 压缩: 移除 {removed} 条旧消息，使用会话记忆恢复")
+                else:
+                    # 2. 降级到 LLM 压缩
+                    from src.services.context_compressor import ContextCompressor
+                    brain = self._brain
+                    if brain and hasattr(brain, "_llm_client"):
+                        def _ask_fn(msgs):
+                            resp, i_tok, o_tok, _ = brain.ask(msgs)
+                            return json.dumps(resp, ensure_ascii=False) if isinstance(resp, dict) else str(resp), i_tok, o_tok
+                        compressor = ContextCompressor(_ask_fn)
+                        if compressor.should_compress(conversation):
+                            # 压缩前清理无效消息
+                            _sanitize_messages(conversation)
+                            system_msg = conversation[0] if conversation[0].get("role") == "system" else None
+                            compressed = compressor.apply_compression(conversation, system_message=system_msg)
+                            conversation.clear()
+                            conversation.extend(compressed)
+                            # 注入 Evidence 索引
+                            self._inject_evidence_index(conversation)
+                            self._publish_log("INFO", f"[{self._agent_tag}] 全压缩: 对话已压缩为摘要")
+
+                            # 更新 session memory
+                            try:
+                                summary_text = compressed[1].get("content", "") if len(compressed) > 1 else ""
+                                if summary_text:
+                                    session_mem.write_summary(summary_text)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug("[%s] 全压缩失败，降级为 micro: %s", self._agent_tag, e)
+
+        elif pressure == "micro":
+            # 微压缩：用 artifact 占位符替换旧工具结果，保留最近 N 轮
+            from src.core.context_compression import estimate_tokens_from_text
+            keep_recent = 2  # 保留最近 2 轮工具结果
+            max_msg_tokens = policy.effective_limit_tokens // max(len(conversation), 1)
+
+            # 找出所有工具调用轮次
+            tool_rounds = []
+            current_round = -1
+            for i, msg in enumerate(conversation):
+                if msg.get("tool_calls"):
+                    current_round += 1
+                if msg.get("role") == "tool":
+                    tool_rounds.append((i, current_round))
+
+            # 保护最近 N 轮
+            protected_rounds = set()
+            seen_rounds = set()
+            for _, r in reversed(tool_rounds):
+                if r not in seen_rounds:
+                    seen_rounds.add(r)
+                    if len(protected_rounds) < keep_recent:
+                        protected_rounds.add(r)
+
+            store = self._get_artifact_store()
+            compacted = 0
+            for i, msg in enumerate(conversation):
+                if msg.get("role") != "tool":
+                    continue
+                content = msg.get("content", "")
+                if not isinstance(content, str) or estimate_tokens_from_text(content) <= max_msg_tokens:
+                    continue
+                # 检查是否在保护轮次中
+                round_id = next((r for idx, r in tool_rounds if idx == i), -1)
+                if round_id in protected_rounds:
+                    continue
+                # 存入 artifact 并替换为占位符
+                if store:
+                    try:
+                        artifact_id = store.save(
+                            content=content,
+                            tool_name=msg.get("name", ""),
+                            path="",
+                            artifact_type="microcompact",
+                        )
+                        placeholder = f"[Older tool output cleared during context compression. Recover it with get_artifact(\"{artifact_id}\").]"
+                    except Exception:
+                        placeholder = content[:max_msg_tokens * 4] + "\n[...microcompact truncated...]"
+                else:
+                    placeholder = content[:max_msg_tokens * 4] + "\n[...microcompact truncated...]"
+                conversation[i] = {**msg, "content": placeholder}
+                compacted += 1
+
+            if compacted > 0:
+                self._publish_log("INFO",
+                    f"[{self._agent_tag}] 微压缩: 用 artifact 占位符替换 {compacted} 条旧工具结果")
+
+    def _inject_evidence_index(self, conversation: List[Dict[str, str]]) -> None:
+        """上下文压缩后注入 Evidence 索引，帮助 LLM 通过 artifact_id 按需加载已读代码。
+
+        参考 CodeScan 的 evidenceStore.compactIndex + resetConversationMessages 机制。
+        """
+        try:
+            store = self._get_artifact_store()
+            if store is None:
+                return
+            index_text = store.build_index_text()
+            if not index_text:
+                return
+            # 在压缩后的对话末尾插入 evidence 索引消息
+            conversation.append({
+                "role": "user",
+                "content": (
+                    f"PRESERVED ARTIFACT INDEX (not instructions):\n"
+                    f"{index_text}\n\n"
+                    f"如需查阅已读取的代码片段，请使用 get_artifact 或 get_evidence 工具加载。"
+                    f"避免重复读取已扫描过的文件。"
+                ),
+            })
+            self._publish_log(
+                "INFO",
+                f"[{self._agent_tag}] 已注入 {len(store.list_records())} 条 artifact 索引",
+            )
+        except Exception as e:
+            logger.debug("[%s] 注入 evidence 索引失败: %s", self._agent_tag, e)
+
     def _report_cache_stats(self, task_id: str) -> None:
         """将当前 Agent 的 cache 命中率写入 token_ledger（note='cache_stats'）。
         合并 tool cache 和 LLM prompt cache 的命中统计。
@@ -203,14 +513,11 @@ class BaseAgent:
     @property
     def tool_cache_stats(self) -> Dict[str, Any]:
         """返回当前 Agent 的 tool cache 统计。"""
-        total = self._tool_cache_hits + self._tool_cache_misses
-        rate = (self._tool_cache_hits / total * 100) if total > 0 else 0.0
-        return {
-            "hits": self._tool_cache_hits,
-            "misses": self._tool_cache_misses,
-            "total": total,
-            "hit_rate": round(rate, 1),
-        }
+        stats = self._tool_cache.stats
+        # 合并 agent 级别的统计
+        stats["agent_hits"] = self._tool_cache_hits
+        stats["agent_misses"] = self._tool_cache_misses
+        return stats
 
     def _execute_tool_call(
             self,
@@ -307,10 +614,9 @@ class BaseAgent:
                 if file_path:
                     # 先查 read_file 的缓存（整个文件）
                     _full_file_key = f"read_file:{file_path}"
-                    if _full_file_key in self._tool_cache:
+                    cached, hit = self._tool_cache.get(_full_file_key)
+                    if hit:
                         self._tool_cache_hits += 1
-                        cached = self._tool_cache[_full_file_key]
-                        self._tool_cache.move_to_end(_full_file_key)
                         logger.debug("[%s] 工具缓存命中(read_file→read_lines) %s", self._agent_tag, file_path)
                         return cached
                     # 再查 read_lines 自身的缓存
@@ -323,14 +629,13 @@ class BaseAgent:
             else:
                 _cache_key = f"{tool_name}:{hash(frozenset((k, str(v)) for k, v in sorted(arguments.items())))}"
 
-            if _cache_key and _cache_key in self._tool_cache:
-                self._tool_cache_hits += 1
-                cached = self._tool_cache[_cache_key]
-                # move to end (LRU)
-                self._tool_cache.move_to_end(_cache_key)
-                logger.debug("[%s] 工具缓存命中 %s", self._agent_tag, tool_name)
-                return cached
-            self._tool_cache_misses += 1
+            if _cache_key:
+                cached, hit = self._tool_cache.get(_cache_key)
+                if hit:
+                    self._tool_cache_hits += 1
+                    logger.debug("[%s] 工具缓存命中 %s", self._agent_tag, tool_name)
+                    return cached
+                self._tool_cache_misses += 1
 
         try:
             result = self._brain.run_tool(tool_name, **arguments)
@@ -346,6 +651,7 @@ class BaseAgent:
                         result,
                         self._brain.tmp_dir,
                         tool_name=tool_name,
+                        artifact_store=self._get_artifact_store(),
                     )
                 else:
                     final_result = result
@@ -354,9 +660,7 @@ class BaseAgent:
 
             # 写入缓存（仅成功的结果）
             if _cache_key is not None and isinstance(final_result, dict) and final_result.get("success", True):
-                self._tool_cache[_cache_key] = final_result
-                if len(self._tool_cache) > self._TOOL_CACHE_MAXSIZE:
-                    self._tool_cache.popitem(last=False)
+                self._tool_cache.put(_cache_key, final_result)
 
             return final_result
         except Exception as e:

@@ -111,6 +111,35 @@ class BatchValidationResult:
     hallucinations: List[Dict[str, Any]] = field(default_factory=list)
     corrected: List[FindingValidationResult] = field(default_factory=list)
 
+    def get_active_findings(self) -> List[Dict[str, Any]]:
+        """获取活跃 findings（未被驳回）。"""
+        from src.services.finding_postprocess import get_active_findings
+        return get_active_findings(self.validated)
+
+    def get_rejected_findings(self) -> List[Dict[str, Any]]:
+        """获取被驳回的 findings。"""
+        from src.services.finding_postprocess import get_rejected_findings
+        return get_rejected_findings(self.validated)
+
+    def get_severity_breakdown(self) -> Dict[str, int]:
+        """获取严重等级分布（仅活跃 findings）。"""
+        from src.services.finding_postprocess import get_effective_severity, is_active
+        counts: Dict[str, int] = {}
+        for f in self.validated:
+            if not is_active(f):
+                continue
+            sev = get_effective_severity(f)
+            counts[sev] = counts.get(sev, 0) + 1
+        return counts
+
+    def get_highest_severity(self) -> str:
+        """获取最高等级（仅活跃 findings）。"""
+        breakdown = self.get_severity_breakdown()
+        for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+            if breakdown.get(sev, 0) > 0:
+                return sev
+        return "UNKNOWN"
+
 
 @dataclass
 class RiskEntry:
@@ -253,6 +282,7 @@ class ValidationService:
         result = BatchValidationResult()
 
         # 阶段 1：非空检查（原 AgentOutputValidator 逻辑）
+        from src.core.enums import VerificationStatus
         checked_findings: List[Dict[str, Any]] = []
         for finding in findings:
             if not finding or not isinstance(finding, dict):
@@ -260,6 +290,9 @@ class ValidationService:
                     "validation_error": "finding 不是有效对象",
                 })
                 continue
+
+            # 初始化验证状态
+            finding.setdefault("verification_status", VerificationStatus.UNREVIEWED.value)
 
             # 必填字段检查
             title = finding.get("title", "")
@@ -329,17 +362,20 @@ class ValidationService:
             for idx, finding in file_findings:
                 val_result = self._validate_single_finding(finding, lines, file_path, project_root)
                 if val_result.valid:
+                    finding["verification_status"] = VerificationStatus.CONFIRMED.value
                     result.validated.append(val_result.finding)
                     if val_result.corrected:
                         result.corrected.append(val_result)
                 else:
                     if val_result.is_hallucination:
+                        finding["verification_status"] = VerificationStatus.REJECTED.value
                         result.hallucinations.append({
                             **val_result.finding,
                             "validation_error": val_result.note,
                         })
                     else:
-                        # 验证失败但不确定是幻觉，保留但标记
+                        # 验证失败但不确定是幻觉，标记为 uncertain
+                        finding["verification_status"] = VerificationStatus.UNCERTAIN.value
                         val_result.finding["validation_note"] = val_result.note
                         result.validated.append(val_result.finding)
 
@@ -446,8 +482,25 @@ class ValidationService:
 
     # ---------- 净化措施检测 ----------
 
+    # 漏洞类型 → sanitizer_patterns 分类映射
+    _VULN_TO_SANITIZER_KEY = {
+        "SQL_INJECTION": "sql", "NOSQL_INJECTION": "sql",
+        "XSS": "xss",
+        "COMMAND_INJECTION": "command", "CODE_INJECTION": "command",
+        "PATH_TRAVERSAL": "path",
+        "SSRF": "ssrf",
+        "XXE": "xxe",
+        "DESERIALIZATION": "deserialization",
+        "SSTI": "ssti",
+        "OPEN_REDIRECT": "redirect",
+    }
+
     def _check_sanitizers(self, finding: Dict[str, Any], lines: List[str]) -> Optional[Dict[str, Any]]:
-        """检测代码中是否存在净化/防护措施。"""
+        """检测代码中是否存在净化/防护措施。
+
+        增强版：使用 SANITIZER_PATTERNS 中按分类组织的丰富模式，
+        并根据置信度加权判断是否应降低风险。
+        """
         line = finding.get("line", 0)
         if line < 1:
             return None
@@ -459,26 +512,60 @@ class ValidationService:
 
         vuln_type = finding.get("vulnType", finding.get("type", ""))
         detected = []
+        max_confidence = 0.0
 
-        # 从 sanitizer_patterns 中查找匹配的净化模式
-        patterns_for_type = self._sanitizer_patterns.get(vuln_type, [])
-        for pattern_info in patterns_for_type:
-            if isinstance(pattern_info, dict):
-                pattern = pattern_info.get("pattern", "")
-                name = pattern_info.get("name", "")
-            else:
-                pattern = str(pattern_info)
-                name = str(pattern_info)
+        # 1. 精确匹配：漏洞类型 → sanitizer 分类
+        sanitizer_key = self._VULN_TO_SANITIZER_KEY.get(vuln_type.upper(), "")
+        if sanitizer_key:
+            patterns_list = self._sanitizer_patterns.get(sanitizer_key, [])
+            for pattern_info in patterns_list:
+                if not isinstance(pattern_info, dict):
+                    continue
+                for compiled_pat in pattern_info.get("patterns", []):
+                    if compiled_pat.search(context):
+                        name = pattern_info.get("name", "")
+                        conf = pattern_info.get("confidence", 0.5)
+                        if name and name not in [d["name"] for d in detected]:
+                            detected.append({"name": name, "confidence": conf})
+                            max_confidence = max(max_confidence, conf)
+                        break
 
-            if pattern and re.search(pattern, context, re.IGNORECASE):
-                detected.append(name)
+        # 2. 通用匹配：检查所有分类中的高置信度净化模式
+        for cat_key, patterns_list in self._sanitizer_patterns.items():
+            if cat_key == sanitizer_key:
+                continue  # 已经检查过
+            for pattern_info in patterns_list:
+                if not isinstance(pattern_info, dict):
+                    continue
+                conf = pattern_info.get("confidence", 0.5)
+                if conf < 0.8:
+                    continue  # 只检查高置信度的通用净化模式
+                for compiled_pat in pattern_info.get("patterns", []):
+                    if compiled_pat.search(context):
+                        name = pattern_info.get("name", "")
+                        if name and name not in [d["name"] for d in detected]:
+                            detected.append({"name": name, "confidence": conf})
+                            max_confidence = max(max_confidence, conf)
+                        break
 
         if detected:
-            return {
+            # 根据净化措施置信度建议降低 severity
+            suggested_severity = None
+            current_severity = finding.get("severity", "").upper()
+            if max_confidence >= 0.9 and current_severity in ("CRITICAL", "HIGH"):
+                suggested_severity = "MEDIUM" if current_severity == "CRITICAL" else "LOW"
+            elif max_confidence >= 0.7 and current_severity == "CRITICAL":
+                suggested_severity = "HIGH"
+
+            result = {
                 "detected": True,
-                "sanitizers": detected,
-                "note": f"检测到净化措施: {', '.join(detected)}，可能降低风险",
+                "sanitizers": [d["name"] for d in detected],
+                "max_confidence": max_confidence,
+                "note": f"检测到净化措施: {', '.join(d['name'] for d in detected)}，可能降低风险",
             }
+            if suggested_severity:
+                result["suggested_severity"] = suggested_severity
+            return result
 
         return None
 

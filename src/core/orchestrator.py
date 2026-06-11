@@ -291,21 +291,43 @@ class Orchestrator:
         information_collection_id: str,
         project_file_list: list,
     ) -> bool:
+        _code_exts = {
+            ".py", ".java", ".js", ".ts", ".php", ".rb", ".go", ".rs",
+            ".cs", ".cpp", ".c", ".h", ".kt", ".swift", ".scala",
+            ".jsx", ".tsx", ".vue", ".svelte", ".dart", ".lua", ".r",
+        }
+        has_code_files = any(
+            os.path.splitext(f)[1].lower() in _code_exts for f in project_file_list
+        )
         try:
             project = get_project(ctx.project_id)
             db_description = (getattr(project, "description", "") or "").strip()
             db_description_compact = (getattr(project, "description_compact", "") or "").strip()
             db_project_session_id = getattr(project, "session_id", "").strip()
             if db_description and db_description_compact:
-                shared_brain.project_info = db_description
-                shared_brain.project_info_compact = db_description_compact
-                shared_brain.set_project_info_session_id(db_project_session_id)
-                self._log(ctx.task_id, "INFO", "复用项目描述信息，跳过信息收集")
-                db_manager.neo4j_repository.update_node(
-                    {"label": "AuditStage", "node_id": information_collection_id},
-                    {"status": "completed", "end_time": datetime.now().isoformat()},
-                )
-                return True
+                if not has_code_files:
+                    self._log(ctx.task_id, "WARNING",
+                              f"项目目录无源代码文件（共 {len(project_file_list)} 个文件），"
+                              "清除旧缓存描述，重新收集信息")
+                    try:
+                        project.description = ""
+                        project.description_compact = ""
+                        from src.infrastructure.db import session_scope as _ss
+                        with _ss() as _s:
+                            _s.merge(project)
+                            _s.commit()
+                    except Exception:
+                        pass
+                else:
+                    shared_brain.project_info = db_description
+                    shared_brain.project_info_compact = db_description_compact
+                    shared_brain.set_project_info_session_id(db_project_session_id)
+                    self._log(ctx.task_id, "INFO", "复用项目描述信息，跳过信息收集")
+                    db_manager.neo4j_repository.update_node(
+                        {"label": "AuditStage", "node_id": information_collection_id},
+                        {"status": "completed", "end_time": datetime.now().isoformat()},
+                    )
+                    return True
         except Exception:
             pass
 
@@ -574,6 +596,19 @@ class Orchestrator:
             # 创建【开始初始化项目】事件
             shared_brain = Brain(brain_ctx)
 
+            # 读取选择性重跑的阶段列表
+            stages_to_rerun = None
+            from src.infrastructure.db import session_scope as _session_scope
+            from src.repositories.task_repository import TaskRepository as _TaskRepo
+            try:
+                with _session_scope() as _s:
+                    _task = _TaskRepo(_s).get(ctx.task_id)
+                    if _task and getattr(_task, "stages_to_rerun", None):
+                        stages_to_rerun = set(_task.stages_to_rerun)
+                        self._log(ctx.task_id, "INFO", f"选择性重跑阶段: {stages_to_rerun}")
+            except Exception:
+                pass
+
             # 0) 统一文件收集（避免后续各服务重复 os.walk）
             project_file_list = self._collect_project_files(str(ctx.project_path))
             self._log(ctx.task_id, "INFO", f"项目文件收集完成: {len(project_file_list)} 个文件")
@@ -583,29 +618,63 @@ class Orchestrator:
 
             # 1) 信息收集阶段
             audit_state.update_progress(1, 4, "信息收集")
-            information_collection_id = self._ensure_stage_node(
-                ctx, task_root_node_id, "Information Collection"
-            )
-            self._log(ctx.task_id, "INFO", f"信息收集阶段 node_id={information_collection_id}")
 
-            # 脱机模式：跳过 LLM 信息收集，用 Tokei 生成基础 project_info
-            if ctx.offline_mode:
-                self._log(ctx.task_id, "INFO", "脱机模式：使用 Tokei 推断项目信息")
-                shared_brain.project_info = self._build_offline_project_info(
-                    ctx, project_file_list
-                )
-                shared_brain.project_info_compact = shared_brain.project_info
+            # 选择性重跑：跳过信息收集阶段
+            if stages_to_rerun and "information_collection" not in stages_to_rerun:
+                self._log(ctx.task_id, "INFO", "选择性重跑：跳过信息收集阶段，复用已有数据")
             else:
-                # 信息收集（必须先完成，Plan 和 QuickScan 都依赖 project_info）
-                if not self._collect_or_reuse_project_info(ctx, shared_brain, information_collection_id, project_file_list):
-                    return
+                information_collection_id = self._ensure_stage_node(
+                    ctx, task_root_node_id, "Information Collection"
+                )
+                self._log(ctx.task_id, "INFO", f"信息收集阶段 node_id={information_collection_id}")
+
+                # 脱机模式：跳过 LLM 信息收集，用 Tokei 生成基础 project_info
+                if ctx.offline_mode:
+                    self._log(ctx.task_id, "INFO", "脱机模式：使用 Tokei 推断项目信息")
+                    shared_brain.project_info = self._build_offline_project_info(
+                        ctx, project_file_list
+                    )
+                    shared_brain.project_info_compact = shared_brain.project_info
+                else:
+                    # 信息收集（必须先完成，Plan 和 QuickScan 都依赖 project_info）
+                    if not self._collect_or_reuse_project_info(ctx, shared_brain, information_collection_id, project_file_list):
+                        return
                 self._mark_stage_completed(ctx.task_id, "信息收集")
+
+            # 1.2) ProjectManifest 预扫描：为每个审计阶段生成热点文件清单
+            try:
+                from src.services.project_manifest import ensure_project_manifest
+                project_manifest = ensure_project_manifest(
+                    project_path=str(ctx.project_path),
+                    task_id=ctx.task_id,
+                    file_list=project_file_list,
+                )
+                shared_brain.project_manifest = project_manifest
+                manifest_summary = project_manifest.to_dict()
+                self._log(
+                    ctx.task_id, "INFO",
+                    f"ProjectManifest 预扫描完成: "
+                    f"路由候选={manifest_summary.get('route_candidate_count', 0)}, "
+                    f"阶段热点={manifest_summary.get('stage_hotspot_counts', {})}",
+                )
+                self._bus.publish(EventStart(
+                    task_id=ctx.task_id,
+                    module=self.MODULE_NAME,
+                    action_type=ActionType.INFORMATION,
+                    reason=f"ProjectManifest: {manifest_summary.get('route_candidate_count', 0)} 路由候选",
+                    status="completed",
+                    result=json.dumps(manifest_summary, ensure_ascii=False),
+                ))
+            except Exception as manifest_ex:
+                self._log(ctx.task_id, "WARNING", f"ProjectManifest 预扫描失败（不影响主流程）: {manifest_ex}")
 
             # 1.5) 信息收集完成后，Plan 和 QuickScan 并行执行
             # Plan 只依赖 project_info，不依赖 QuickScan 结果
             # QuickScan 只依赖文件列表，不依赖 Plan
             # 两者在 Sink/Chain 开始前汇合即可
             # 脱机模式：跳过 Plan（LLM），仅执行 QuickScan
+            # 选择性重跑：如果不需要重跑 planning，也跳过
+            _skip_planning = stages_to_rerun and "planning" not in stages_to_rerun
 
             plan_result = None
             plan_id = None
@@ -679,6 +748,22 @@ class Orchestrator:
 
                 quick_scan_findings = scan_result.get("findings", [])
                 scan_stats = scan_result.get("stats", {})
+                # 设置来源模式（从项目的 source_type 推导）
+                try:
+                    from src.services.project_service import get_project as _get_proj
+                    _proj = _get_proj(ctx.project_id)
+                    _st = getattr(_proj, "source_type", "") or ""
+                    _source_mode_map = {
+                        "zip": "ZIP 代码包上传",
+                        "git": "Git 仓库克隆",
+                        "url": "URL 导入",
+                        "local": "本地代码导入",
+                        "github": "GitHub 候选发现",
+                        "gitee": "Gitee 候选发现",
+                    }
+                    scan_stats["source_mode"] = _source_mode_map.get(_st.lower(), _st or "未知")
+                except Exception:
+                    scan_stats.setdefault("source_mode", "未知")
                 if quick_scan_findings:
                     self._log(ctx.task_id, "INFO",
                               f"快速扫描完成: 发现 {len(quick_scan_findings)} 个潜在问题 "
@@ -826,6 +911,10 @@ class Orchestrator:
 
             if ctx.offline_mode:
                 self._log(ctx.task_id, "INFO", "脱机模式：跳过审计计划生成，仅执行快速扫描")
+                _run_quick_scan_pipeline()
+                self._mark_stage_completed(ctx.task_id, "Quick Scan")
+            elif _skip_planning:
+                self._log(ctx.task_id, "INFO", "选择性重跑：跳过审计计划生成，仅执行快速扫描")
                 _run_quick_scan_pipeline()
                 self._mark_stage_completed(ctx.task_id, "Quick Scan")
             elif ctx.extra.get("enable_sink_finder", False):
@@ -986,8 +1075,11 @@ class Orchestrator:
 
             # 3) Phase 3: LLM 验证 + 文件级审计（脱机模式跳过）
             #     Phase 3A: SinkFinder + ChainAnalyzer 仅在 enable_sink_finder=True 时执行
+            _skip_sink_chain = stages_to_rerun and "sink_discovery" not in stages_to_rerun and "chain_analysis" not in stages_to_rerun
             if ctx.offline_mode:
                 self._log(ctx.task_id, "INFO", "脱机模式：跳过 LLM 审计阶段")
+            elif _skip_sink_chain:
+                self._log(ctx.task_id, "INFO", "选择性重跑：跳过 Sink/Chain 分析阶段")
             else:
                 audit_state.update_progress(3, 4, "Sink发现与链路分析")
                 sink_chain_error = None
@@ -1025,7 +1117,8 @@ class Orchestrator:
                     def _run_sink_and_chain():
                         nonlocal sink_chain_error, task_paused
                         try:
-                            self._drive_sink_and_chain(ctx, plan_id, sink_finder, chain_analyzer)
+                            self._drive_sink_and_chain(ctx, plan_id, sink_finder, chain_analyzer,
+                                                       stages_to_rerun=stages_to_rerun)
                         except TaskPausedError:
                             task_paused = True
                             self._log(ctx.task_id, "INFO", "任务已暂停，编排协作式退出")
@@ -1656,9 +1749,24 @@ class Orchestrator:
                     f"任务完成时仍有 {leftover} 条 running 事件，已强制标记为 completed",
                 )
 
+            # 从数据库重新统计实际漏洞数（防止 all_findings_for_report 与 DB 不一致）
+            try:
+                from sqlalchemy import func as _sa_func
+                from src.infrastructure.db.models.vulnerability import Vulnerability as _VulnModel
+                from src.infrastructure.db import session_scope as _ss
+                with _ss() as _s:
+                    actual_vuln_count = _s.query(
+                        _sa_func.count(_VulnModel.id)
+                    ).filter(
+                        _VulnModel.task_id == ctx.task_id,
+                        _VulnModel.status != "false_positive",
+                    ).scalar() or len(all_findings_for_report)
+            except Exception:
+                actual_vuln_count = len(all_findings_for_report)
+
             self._bus.publish(TaskStatusEvent(
                 task_id=ctx.task_id, status="completed",
-                vuln_count=len(all_findings_for_report),
+                vuln_count=actual_vuln_count,
             ))
             self._log(ctx.task_id, "INFO", f"任务 {ctx.task_id} 编排完成")
         except TaskPausedError:
@@ -1789,6 +1897,7 @@ class Orchestrator:
         plan_id: str,
         sink_finder: SinkFinder,
         chain_analyzer: ChainAnalyzer,
+        stages_to_rerun: Optional[set] = None,
     ) -> None:
         """按优先级层级（L1-L4）流水线驱动 SinkFinder + ChainAnalyzer。
 
@@ -1827,7 +1936,7 @@ class Orchestrator:
         max_workers = min(5, total_cats)
 
         _run_sink_chain_pipeline = self._make_sink_chain_pipeline(
-            ctx, sink_finder, chain_analyzer
+            ctx, sink_finder, chain_analyzer, stages_to_rerun=stages_to_rerun
         )
 
         self._log(ctx.task_id, "INFO",
@@ -1865,6 +1974,7 @@ class Orchestrator:
         ctx: ExecutionContext,
         sink_finder: SinkFinder,
         chain_analyzer: ChainAnalyzer,
+        stages_to_rerun: Optional[set] = None,
     ):
         """创建 SinkFinder→ChainAnalyzer 流水线闭包（避免嵌套函数无法 pickle）。"""
 
@@ -1906,12 +2016,30 @@ class Orchestrator:
                            f"依据：{cat_row.get('reasoning_basis', '')}",
                 )
                 try:
+                    # 复跑模式：注入 Gap Check 提示词
+                    _run_kind = "initial"
+                    _existing = None
+                    if stages_to_rerun and "sink_discovery" in stages_to_rerun:
+                        _run_kind = "gap_check"
+                        # 尝试从 Neo4j 获取该漏洞类型已有的 sink 发现
+                        try:
+                            _existing = self._fetch_existing_sinks_for_category(
+                                ctx.task_id, category_name, language_name
+                            )
+                        except Exception:
+                            _existing = None
+                        if _existing:
+                            self._log(ctx.task_id, "INFO",
+                                      f"[{tier_name}] Gap Check 模式: {language_name}/{category_name}, "
+                                      f"已有 {len(_existing)} 条发现")
                     sink_finder.run(
                         language_name,
                         category_name,
                         vul_node_id,
                         cat_row.get("reasoning_basis", ""),
                         cat_row.get("risk_description", ""),
+                        run_kind=_run_kind,
+                        existing_findings=_existing,
                     )
                     self._log(ctx.task_id, "INFO",
                               f"[{tier_name}] SinkFinder 完成: {language_name}/{category_name}")
@@ -1938,6 +2066,40 @@ class Orchestrator:
                           f"{language_name}/{category_name}: {ex}")
 
         return _pipeline
+
+    def _fetch_existing_sinks_for_category(
+        self, task_id: str, category_name: str, language_name: str
+    ) -> List[Dict[str, Any]]:
+        """从 Neo4j 获取指定漏洞类型已有的 SinkFlowNode 发现（用于 Gap Check 模式）。"""
+        try:
+            query = """
+            MATCH (t:Task {task_id: $task_id})-[:HAS_STAGE]->(s:AuditStage)
+                  -[:HAS_STAGE]->(rc:RiskCategory {category_name: $category_name})
+                  -[:HAS_SINK]->(sf:SinkFlowNode)
+            WHERE sf.status = 'completed'
+            RETURN sf.file AS file, sf.line AS line, sf.function AS function,
+                   sf.reason AS reason, sf.end_line AS end_line
+            LIMIT 50
+            """
+            results = db_manager.neo4j_repository.client.execute_read(
+                query,
+                {"task_id": task_id, "category_name": category_name},
+            )
+            if not results:
+                return []
+            return [
+                {
+                    "file": r.get("file", ""),
+                    "line": r.get("line", 0),
+                    "function": r.get("function", ""),
+                    "reason": r.get("reason", ""),
+                    "end_line": r.get("end_line", 0),
+                }
+                for r in results
+                if r.get("file")
+            ]
+        except Exception:
+            return []
 
     def _mark_completed_languages(self, plan_id: str, running_set: set) -> None:
         """检查并标记所有漏洞类型已完成的语言为 completed。"""

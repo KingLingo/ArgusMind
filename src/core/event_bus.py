@@ -1,17 +1,22 @@
-"""事件总线：按类型订阅 + 发布
+"""事件总线：按类型订阅 + 发布 + SSE 实时推送
 
 - 同步调用（publish 直接执行所有已注册 handler）
 - 按事件 dataclass 的类型订阅；子类默认不继承，需显式订阅
 - 发布时 handler 可通过 `event.set_result(value)` 写回结果，供调用方拿到（例如 start → event_id）
 - 捕获 handler 异常，避免单个 handler 崩溃影响整条流水
+- SSE 支持：subscribe_task_events 返回异步队列，用于 Server-Sent Events 推送
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Type
+from dataclasses import asdict
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Type
 
 from src.core.events import _EventBase, LogEvent, TokenEvent, TaskStatusEvent
 
@@ -32,6 +37,10 @@ class EventBus:
             thread_name_prefix="event-bus-async",
         )
         self._own_pool = True
+        # SSE 订阅者：task_id -> list of asyncio.Queue
+        self._sse_subscribers: Dict[str, List[asyncio.Queue]] = defaultdict(list)
+        self._sse_lock = threading.Lock()
+        self._sequence: Dict[str, int] = defaultdict(int)
 
     def subscribe(self, event_type: Type, handler: EventHandler) -> None:
         with self._lock:
@@ -68,6 +77,8 @@ class EventBus:
                     getattr(h, "__name__", repr(h)),
                     ex,
                 )
+        # 自动推送 SSE
+        self._try_push_sse(event)
         return event.result
 
     def publish_async(self, event: _EventBase) -> None:
@@ -79,6 +90,8 @@ class EventBus:
         with self._lock:
             handlers = list(self._handlers.get(type(event), []))
         if not handlers:
+            # 即使没有 handler，也推送 SSE
+            self._try_push_sse(event)
             return
         for h in handlers:
             try:
@@ -89,6 +102,8 @@ class EventBus:
                     getattr(h, "__name__", repr(h)),
                     ex,
                 )
+        # 自动推送 SSE
+        self._try_push_sse(event)
 
     def _run_handler(self, event: _EventBase, handler: EventHandler) -> None:
         try:
@@ -100,6 +115,98 @@ class EventBus:
                 getattr(handler, "__name__", repr(handler)),
                 ex,
             )
+
+    # ---- SSE 实时推送支持 ----
+
+    def _try_push_sse(self, event: _EventBase) -> None:
+        """从事件中提取 task_id，如有 SSE 订阅者则推送。"""
+        task_id = getattr(event, "task_id", None)
+        if not task_id:
+            return
+        event_type = type(event).__name__
+        data: Dict[str, Any] = {}
+        for field_name in ("level", "module", "message", "status", "vul_name", "verdict"):
+            val = getattr(event, field_name, None)
+            if val is not None:
+                data[field_name] = val
+        self.publish_to_sse(str(task_id), event_type, data)
+
+    def subscribe_task_events(self, task_id: str) -> asyncio.Queue:
+        """订阅指定任务的事件流（用于 SSE 推送）。
+
+        返回一个 asyncio.Queue，调用方从队列中读取事件。
+        每个事件是一个 dict，包含 sequence、type、data 等字段。
+        """
+        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        with self._sse_lock:
+            self._sse_subscribers[task_id].append(queue)
+        logger.debug("[event_bus] SSE 订阅 task_id=%s, 当前订阅数=%d",
+                     task_id, len(self._sse_subscribers[task_id]))
+        return queue
+
+    def unsubscribe_task_events(self, task_id: str, queue: asyncio.Queue) -> None:
+        """取消 SSE 订阅。"""
+        with self._sse_lock:
+            subscribers = self._sse_subscribers.get(task_id, [])
+            if queue in subscribers:
+                subscribers.remove(queue)
+            if not subscribers and task_id in self._sse_subscribers:
+                del self._sse_subscribers[task_id]
+        logger.debug("[event_bus] SSE 取消订阅 task_id=%s", task_id)
+
+    def publish_to_sse(self, task_id: str, event_type: str, data: Dict[str, Any]) -> None:
+        """发布事件到 SSE 订阅队列。"""
+        with self._sse_lock:
+            subscribers = list(self._sse_subscribers.get(task_id, []))
+        if not subscribers:
+            return
+
+        self._sequence[task_id] += 1
+        payload = {
+            "sequence": self._sequence[task_id],
+            "type": event_type,
+            "task_id": task_id,
+            "timestamp": time.time(),
+            "data": data,
+        }
+
+        for queue in subscribers:
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("[event_bus] SSE 队列已满，丢弃事件 task_id=%s", task_id)
+
+    def emit_task_event(self, task_id: str, event_type: str, data: Dict[str, Any]) -> None:
+        """便捷方法：同时发布到传统 handler 和 SSE 队列。"""
+        self.publish_to_sse(task_id, event_type, data)
+
+    async def sse_event_stream(
+        self, task_id: str, after_sequence: int = 0
+    ) -> AsyncIterator[str]:
+        """生成 SSE 格式的事件流（用于 FastAPI StreamingResponse）。
+
+        Args:
+            task_id: 任务 ID
+            after_sequence: 只推送该序号之后的事件（用于断线重连）
+
+        Yields:
+            SSE 格式的字符串（data: {...}\n\n）
+        """
+        queue = self.subscribe_task_events(task_id)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    sequence = event.get("sequence", 0)
+                    if sequence > after_sequence:
+                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # 发送心跳保持连接
+                    yield f": heartbeat {time.time()}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.unsubscribe_task_events(task_id, queue)
 
 
 # 全局单例

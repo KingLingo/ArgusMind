@@ -132,10 +132,14 @@ def limit_tool_result(
     *,
     tool_name: str = "",
     max_bytes: int = TOOL_OUTPUT_MAX_BYTES,
+    artifact_store: Any = None,
 ) -> Dict[str, Any]:
     """
     若工具返回 dict 序列化后超过 max_bytes，将截断掉的后续内容写入 tmp_dir，
     对话中仅返回不超过上限的开头部分及提示。
+
+    当提供 artifact_store（ArtifactStore 实例）时，溢出内容同时存入 artifact，
+    可通过 artifact_id 按需加载。
     """
     if not isinstance(result, dict):
         return result
@@ -164,12 +168,30 @@ def limit_tool_result(
     )
 
     overflow_bytes = 0
+    artifact_id = ""
     if overflow:
         overflow_bytes = _write_overflow(out_path, overflow)
+        # 同时存入 ArtifactStore（如果提供）
+        if artifact_store is not None:
+            try:
+                overflow_content = "\n".join(str(line) for line in overflow) if isinstance(overflow, list) else str(overflow)
+                artifact_id = artifact_store.save(
+                    content=overflow_content,
+                    tool_name=tool_name,
+                    path=str(out_path),
+                    artifact_type="tool_output",
+                    truncated=True,
+                )
+            except Exception:
+                pass  # Artifact 存储失败不影响主流程
 
     final_notice = (
         f"[提示] 工具返回内容超过单次输出上限（{max_bytes} 字节），"
         f"截断掉的后续内容已写入临时文件：{out_path}。"
+    )
+    if artifact_id:
+        final_notice += f" 可通过 artifact_id={artifact_id} 按需加载完整内容。"
+    final_notice += (
         f"全文共 {original_bytes} 字节，溢出约 {overflow_bytes} 字节；以下仅含开头部分。"
     )
     kept = _apply_final_notice(kept, _NOTICE_PLACEHOLDER, final_notice)
@@ -180,6 +202,7 @@ def limit_tool_result(
             "overflow_output_path": str(out_path),
             "original_output_bytes": original_bytes,
             "overflow_output_bytes": overflow_bytes,
+            "artifact_id": artifact_id,
         }
     )
     shell["data"] = kept

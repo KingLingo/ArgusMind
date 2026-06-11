@@ -58,20 +58,33 @@ class ContextCompressor:
         compressed = await compressor.compress(messages, model_name)
     """
 
-    def __init__(self, ask_fn, max_history_tokens: int = 8000):
+    def __init__(self, ask_fn, max_history_tokens: int = 0):
         """
         Args:
             ask_fn: 可调用对象，签名为 (messages: list) -> (content: str, in_tok: int, out_tok: int)
-            max_history_tokens: 触发压缩的历史 token 阈值
+            max_history_tokens: 触发压缩的历史 token 阈值（0 = 自动从 ContextCompressionPolicy 推导）
         """
         self._ask = ask_fn
-        self._max_history_tokens = max_history_tokens
         self._token_estimator = _default_token_estimator
+        # 自动推导压缩阈值
+        if max_history_tokens > 0:
+            self._max_history_tokens = max_history_tokens
+        else:
+            from src.core.context_compression import get_compression_policy
+            policy = get_compression_policy()
+            self._max_history_tokens = policy.full_limit_tokens
 
     def should_compress(self, messages: List[Dict[str, str]]) -> bool:
-        """判断是否需要进行上下文压缩。"""
+        """判断是否需要进行上下文压缩（基于 ContextCompressionPolicy 推导的阈值）。"""
         estimated = sum(self._token_estimator(m) for m in messages)
-        return estimated >= self._max_history_tokens
+        if estimated >= self._max_history_tokens:
+            return True
+        # 二次检查：使用 policy 的压力级别
+        from src.core.context_compression import estimate_messages_tokens
+        prompt_tokens = estimate_messages_tokens(messages)
+        from src.core.context_compression import get_compression_policy
+        policy = get_compression_policy()
+        return policy.needs_compaction(prompt_tokens)
 
     def compress(
         self,

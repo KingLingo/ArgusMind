@@ -24,6 +24,7 @@ class Task(Base):
     todo: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSONB, default=list, nullable=True)
     error: Mapped[str] = mapped_column(Text, default="", nullable=False)
     vuln_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    stages_to_rerun: Mapped[Optional[List[str]]] = mapped_column(JSONB, default=None, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(

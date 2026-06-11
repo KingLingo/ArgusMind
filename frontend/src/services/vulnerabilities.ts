@@ -50,7 +50,7 @@ export type ExploitationChainDocument = {
   error?: string | null;
 };
 
-export type VulnVerificationStatus = 'CONFIRMED' | 'REJECTED' | '';
+export type VulnVerificationStatus = 'CONFIRMED' | 'REJECTED' | 'UNREVIEWED' | 'UNCERTAIN' | '';
 
 export type VulnerabilityListItem = {
   id: string;
@@ -85,6 +85,7 @@ export type VulnerabilityDetail = VulnerabilityListItem & {
   securityBoundaries: string;
   analysisRounds: number;
   astContext?: Record<string, unknown> | null;
+  reviewedSeverity?: string;
 };
 
 export type PageResult<T> = {
@@ -111,7 +112,7 @@ function normalizeVerificationStatus(
   raw: string | undefined | null,
 ): VulnVerificationStatus {
   const s = (raw || '').trim().toUpperCase();
-  if (s === 'CONFIRMED' || s === 'REJECTED') return s;
+  if (s === 'CONFIRMED' || s === 'REJECTED' || s === 'UNREVIEWED' || s === 'UNCERTAIN') return s;
   return '';
 }
 
@@ -239,6 +240,7 @@ function mapFindingToDetail(
     securityBoundaries: d?.security_boundaries || '',
     analysisRounds: d?.analysis_rounds ?? 0,
     astContext: (d as any)?.ast_context ?? null,
+    reviewedSeverity: d?.reviewed_severity || '',
   };
 }
 

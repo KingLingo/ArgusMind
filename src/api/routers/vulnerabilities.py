@@ -16,6 +16,7 @@ from src.schemas.vulnerability import (
     FindingRead,
     FindingStatusUpdate,
     FindingUpdate,
+    FindingVerificationUpdate,
 )
 from src.services import stats_service, vulnerability_service
 
@@ -186,3 +187,19 @@ def delete_finding(finding_id: str) -> OkResponse[bool]:
     if not ok:
         raise NotFoundError("漏洞不存在")
     return OkResponse[bool](data=True)
+
+
+@router.patch("/{finding_id}/verification", response_model=OkResponse[FindingRead])
+def update_finding_verification(
+    finding_id: str, body: FindingVerificationUpdate
+) -> OkResponse[FindingRead]:
+    """更新漏洞的三态验证状态（confirmed / uncertain / rejected）。"""
+    f = vulnerability_service.update_finding_verification(
+        finding_id,
+        body.verification_status,
+        body.verification_reason,
+        body.reviewed_severity,
+    )
+    if f is None:
+        raise NotFoundError("漏洞不存在")
+    return OkResponse[FindingRead](data=FindingRead.model_validate(f))

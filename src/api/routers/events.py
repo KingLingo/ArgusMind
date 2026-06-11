@@ -109,3 +109,28 @@ def get_human_approval(interaction_id: str) -> OkResponse[HumanApprovalRead]:
     if result is None:
         raise NotFoundError("交互不存在")
     return OkResponse[HumanApprovalRead](data=HumanApprovalRead.model_validate(result))
+
+
+@router.get("/sse/{task_id}")
+async def task_event_sse(
+    task_id: str,
+    after: int = Query(0, ge=0, description="断线重连序号，只推送该序号之后的事件"),
+):
+    """SSE 实时事件流端点。
+
+    前端通过 EventSource 连接此端点，实时接收任务事件推送。
+    支持断线重连：传入 after 参数可跳过已接收的事件。
+    """
+    from fastapi.responses import StreamingResponse
+    from src.core.event_bus import get_event_bus
+
+    bus = get_event_bus()
+    return StreamingResponse(
+        bus.sse_event_stream(task_id, after_sequence=after),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

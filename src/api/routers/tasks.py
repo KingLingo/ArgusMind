@@ -6,6 +6,7 @@ from uuid import UUID
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from pydantic import BaseModel, Field
 
 import src.storage.manager as db_manager
 from src.api.deps import Pagination, pagination
@@ -289,6 +290,74 @@ def retry_task(task_id: UUID, background: BackgroundTasks) -> OkResponse[TaskRea
     return OkResponse[TaskRead](data=TaskRead.model_validate(task))
 
 
+@router.get("/{task_id}/pause")
+@router.post("/{task_id}/pause")
+def pause_task(task_id: UUID):
+    """暂停正在运行的任务。"""
+    from src.core.task_control import get_task_control
+    from src.storage import manager as db_manager
+
+    task_id_str = str(task_id)
+    task = task_service.get_task_by_id(task_id_str)
+    if not task:
+        raise NotFoundError("任务不存在")
+    if task.status != "running":
+        raise BadRequestError("只能暂停 running 状态的任务")
+
+    # 设置内存暂停标志
+    get_task_control().set_paused(task_id_str)
+    # 持久化到数据库
+    try:
+        with db_manager.get_session() as session:
+            from src.infrastructure.db.models.task import Task as TaskModel
+            t = session.query(TaskModel).filter(TaskModel.id == task_id_str).first()
+            if t:
+                t.status = "paused"
+                session.commit()
+    except Exception as ex:
+        logger.warning("持久化暂停状态失败: %s", ex)
+
+    return OkResponse(data={"task_id": task_id_str, "status": "paused"})
+
+
+@router.get("/{task_id}/resume")
+@router.post("/{task_id}/resume")
+def resume_task(task_id: UUID, background: BackgroundTasks):
+    """恢复已暂停的任务。"""
+    from src.core.task_control import get_task_control
+
+    task_id_str = str(task_id)
+    task = task_service.get_task_by_id(task_id_str)
+    if not task:
+        raise NotFoundError("任务不存在")
+    if task.status != "paused":
+        raise BadRequestError("只能恢复 paused 状态的任务")
+
+    # 清除内存暂停标志
+    get_task_control().clear_paused(task_id_str)
+    # 更新数据库状态
+    try:
+        from src.storage import manager as db_manager
+        with db_manager.get_session() as session:
+            from src.infrastructure.db.models.task import Task as TaskModel
+            t = session.query(TaskModel).filter(TaskModel.id == task_id_str).first()
+            if t:
+                t.status = "running"
+                session.commit()
+    except Exception as ex:
+        logger.warning("持久化恢复状态失败: %s", ex)
+
+    # 重新启动任务
+    def _runner():
+        try:
+            run_task(task_id_str, project_id=task.project_id)
+        except Exception as ex:
+            logger.exception("[resume_task] 执行异常: %s", ex)
+
+    background.add_task(_runner)
+    return OkResponse(data={"task_id": task_id_str, "status": "running"})
+
+
 @router.get("/{task_id}/run", response_model=OkResponse[TaskRead])
 def run_task_endpoint(task_id: UUID, background: BackgroundTasks) -> OkResponse[TaskRead]:
     task_id_str = str(task_id)
@@ -299,6 +368,42 @@ def run_task_endpoint(task_id: UUID, background: BackgroundTasks) -> OkResponse[
     def _runner():
         try:
             run_task(task_id_str)
+        except AuditConfigMissing as ex:
+            logger.warning("[run_task] 配置缺失: %s", ex)
+        except Exception as ex:  # pragma: no cover
+            logger.exception("[run_task] 执行异常: %s", ex)
+
+    background.add_task(_runner)
+    return OkResponse[TaskRead](data=TaskRead.model_validate(task))
+
+
+class RerunStagesRequest(BaseModel):
+    selected_stages: List[str] = Field(
+        ..., description="要重跑的审计阶段列表", min_length=1
+    )
+
+
+@router.post("/{task_id}/rerun", response_model=OkResponse[TaskRead])
+def rerun_selected_stages(
+    task_id: UUID, body: RerunStagesRequest, background: BackgroundTasks
+) -> OkResponse[TaskRead]:
+    """选择性重跑指定审计阶段。
+
+    仅允许 completed/failed 状态的任务。将任务重置为 pending 并重新执行选定阶段。
+    """
+    task_id_str = str(task_id)
+    try:
+        task = task_service.rerun_selected_stages(task_id_str, body.selected_stages)
+    except task_service.TaskNotFound:
+        raise NotFoundError("任务不存在")
+    except task_service.InvalidTaskState as ex:
+        raise BadRequestError(str(ex))
+    except ValueError as ex:
+        raise BadRequestError(str(ex))
+
+    def _runner():
+        try:
+            run_task(task_id_str, project_id=task.project_id)
         except AuditConfigMissing as ex:
             logger.warning("[run_task] 配置缺失: %s", ex)
         except Exception as ex:  # pragma: no cover

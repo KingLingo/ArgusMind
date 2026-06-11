@@ -855,7 +855,8 @@ class SinkFinder(BaseAgent):
         except Exception:
             return ""
 
-    def run(self, language, vul_name, vul_node_id, reasoning_basis, risk_description):
+    def run(self, language, vul_name, vul_node_id, reasoning_basis, risk_description,
+            run_kind: str = "initial", existing_findings: Optional[List[Dict[str, Any]]] = None):
         # 注入知识库语言审计规则
         lang_ext = f".{language.lower()}" if not language.startswith(".") else language.lower()
         lang_rules = LANGUAGE_AUDIT_RULES_LLM.get(lang_ext, "")
@@ -925,6 +926,21 @@ class SinkFinder(BaseAgent):
             vul_guide = get_vulnerability_guide(vul_name)
             if vul_guide:
                 system_content += "\n\n" + vul_guide
+        except Exception:
+            pass
+
+        # 注入阶段感知提示词（专用扫描指引 + 热点文件 + 路由上下文 + Gap Check/Revalidate）
+        try:
+            from src.agents.prompt.stage_aware import build_stage_aware_prompt
+            manifest = getattr(self._brain, "project_manifest", None)
+            system_content = build_stage_aware_prompt(
+                base_prompt=system_content,
+                vul_name=vul_name,
+                language=language,
+                manifest=manifest,
+                run_kind=run_kind,
+                existing_findings=existing_findings,
+            )
         except Exception:
             pass
 
@@ -1091,6 +1107,23 @@ class SinkFinder(BaseAgent):
                             }, ensure_ascii=False),
                         })
                         continue
+
+                    # Schema 校验：检查必填字段、严重等级、去重
+                    try:
+                        from src.agents.output_validator import validate_findings_output
+                        raw_json = json.dumps(final_output, ensure_ascii=False)
+                        validated, val_result = validate_findings_output(raw_json, vul_name, auto_fix=True)
+                        if val_result.fixed_count > 0:
+                            self._publish_log("INFO",
+                                f"[SinkFinder] Schema 校验自动修复 {val_result.fixed_count} 条发现")
+                        if val_result.warnings:
+                            for w in val_result.warnings[:3]:
+                                self._publish_log("WARNING",
+                                    f"[SinkFinder] Schema 校验警告: 第{w.item_index}条 {w.field} - {w.message}")
+                        if validated:
+                            final_output = validated
+                    except Exception:
+                        pass  # 校验失败不影响主流程
 
                     self._publish_log("INFO", f"[SinkFinder] LLM 返回 final，sink 候选={len(final_output)}")
                     normalized, err = _validate_and_normalize_sink_res(final_output, self._brain.project_path)
@@ -1435,6 +1468,18 @@ class SinkRefineAgent(BaseAgent):
                         }, ensure_ascii=False),
                     })
                     continue
+                # Schema 校验
+                try:
+                    from src.agents.output_validator import validate_findings_output
+                    raw_json = json.dumps(sinks, ensure_ascii=False)
+                    validated, val_result = validate_findings_output(raw_json, vul_name, auto_fix=True)
+                    if val_result.fixed_count > 0:
+                        self._publish_log("INFO",
+                            f"[SinkRefineAgent] Schema 校验自动修复 {val_result.fixed_count} 条")
+                    if validated:
+                        sinks = validated
+                except Exception:
+                    pass
                 normalized, err = _validate_and_normalize_sink_res(sinks, project_path)
                 if err:
                     self._publish_log(
