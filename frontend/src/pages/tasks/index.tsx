@@ -2,6 +2,7 @@ import { ExclamationCircleOutlined } from '@ant-design/icons';
 import type { ActionType, ProColumns } from '@ant-design/pro-components';
 import {
   ModalForm,
+  ProFormDigit,
   ProFormSelect,
   ProFormSwitch,
   ProFormText,
@@ -529,6 +530,7 @@ const TasksPage: React.FC = () => {
         projectId: string;
         offlineMode: boolean;
         enableSinkFinder: boolean;
+        tokenBudget?: number;
       }>
         title="创建扫描任务"
         open={open}
@@ -549,6 +551,7 @@ const TasksPage: React.FC = () => {
               project_id: values.projectId,
               offline_mode: values.offlineMode ?? false,
               enable_sink_finder: values.enableSinkFinder ?? false,
+              token_budget: values.tokenBudget ?? 0,
             });
             message.success('任务已创建');
             actionRef.current?.reload();
@@ -590,6 +593,14 @@ const TasksPage: React.FC = () => {
           fieldProps={{
             defaultChecked: false,
           }}
+        />
+        <ProFormDigit
+          name="tokenBudget"
+          label="Token 预算上限"
+          tooltip="任务累计 token（输入+输出）达到此上限时自动暂停，避免失控消耗；0 或留空表示不限。上调后可恢复任务继续。"
+          min={0}
+          fieldProps={{ precision: 0, step: 10000 }}
+          placeholder="0 表示不限"
         />
       </ModalForm>
     </>

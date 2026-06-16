@@ -187,8 +187,12 @@ class ChainAnalyzer(BaseAgent):
             return
 
         def _ask_wrapper(messages: List[Dict[str, str]]):
-            """将 brain.ask 的 (result, in_tok, out_tok) 适配为压缩器的签名。"""
-            result, in_tok, out_tok = self._brain.ask(messages)
+            """将 brain.ask 的返回适配为压缩器的签名。
+
+            brain.ask 返回 4 元组 (result, in_tok, out_tok, cached_tok)，
+            此前只解包 3 个会触发 ValueError，导致上下文压缩一旦触发即崩溃。
+            """
+            result, in_tok, out_tok, _cached = self._brain.ask(messages)
             content = result.get("content", "") if isinstance(result, dict) else str(result)
             return content, in_tok, out_tok
 

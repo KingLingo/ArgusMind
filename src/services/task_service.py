@@ -44,6 +44,7 @@ def create_task(data: AuditTaskCreate) -> Task:
             name=data.name,
             offline_mode=data.offline_mode,
             enable_sink_finder=data.enable_sink_finder,
+            token_budget=data.token_budget,
             status="pending",
         )
         TaskRepository(session).add(task)

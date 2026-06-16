@@ -62,7 +62,8 @@ class ChainConfirmer(BaseAgent):
             return
 
         def _ask_wrapper(messages: List[Dict[str, str]]):
-            result, in_tok, out_tok = self._brain.ask(messages)
+            # brain.ask 返回 4 元组；此前只解包 3 个会在压缩触发时崩 ValueError
+            result, in_tok, out_tok, _cached = self._brain.ask(messages)
             content = result.get("content", "") if isinstance(result, dict) else str(result)
             return content, in_tok, out_tok
 

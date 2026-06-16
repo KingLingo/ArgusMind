@@ -58,11 +58,13 @@ def run_task(task_id: str, project_id: Optional[str] = None, offline_mode: bool 
 
         # 始终从 Task 读取 offline_mode（重跑/恢复时不传此参数）
         enable_sink_finder = False
+        token_budget = 0
         if not offline_mode:
             task_record = session.get(Task, task_id)
             if task_record is not None:
                 offline_mode = getattr(task_record, "offline_mode", False)
                 enable_sink_finder = getattr(task_record, "enable_sink_finder", False)
+                token_budget = int(getattr(task_record, "token_budget", 0) or 0)
 
     # 脱机模式不需要 LLM 配置；非脱机模式必须配置 LLM
     llm_cfg = None
@@ -107,6 +109,7 @@ def run_task(task_id: str, project_id: Optional[str] = None, offline_mode: bool 
         llm_config=llm_cfg,
         opencode_config=opencode_cfg,
         offline_mode=offline_mode,
+        token_budget=token_budget,
         extra={"enable_sink_finder": enable_sink_finder},
     )
 

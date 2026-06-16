@@ -17,4 +17,5 @@ class ExecutionContext:
     llm_config: LLMConfig
     opencode_config: Optional[OpenCodeConfig] = None
     offline_mode: bool = False
+    token_budget: int = 0  # 任务级 token 预算上限；0 表示不限
     extra: Dict[str, Any] = field(default_factory=dict)

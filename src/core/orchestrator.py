@@ -592,6 +592,7 @@ class Orchestrator:
                 task_id=ctx.task_id,
                 llm_config=ctx.llm_config,
                 offline_mode=ctx.offline_mode,
+                token_budget=ctx.token_budget,
             )
             # 创建【开始初始化项目】事件
             shared_brain = Brain(brain_ctx)

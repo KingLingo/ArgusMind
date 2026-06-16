@@ -16,6 +16,8 @@ class AuditTaskCreate(BaseModel):
                                 description="脱机模式：仅使用规则引擎和快速扫描，不调用 LLM")
     enable_sink_finder: bool = Field(False, alias="enableSinkFinder",
                                       description="启用 SinkFinder 深度审计（逐类型搜索危险函数+链路分析，耗时较长）")
+    token_budget: int = Field(0, alias="tokenBudget", ge=0,
+                              description="任务级 token 预算上限（输入+输出累计），0 表示不限；超额自动暂停")
 
 
 class TaskUpdate(BaseModel):
@@ -32,6 +34,7 @@ class TaskRead(BaseModel):
     name: str
     offline_mode: bool = False
     enable_sink_finder: bool = False
+    token_budget: int = Field(0, serialization_alias="tokenBudget")
     status: str
     todo: Optional[List[Dict[str, Any]]] = None
     llm_input_token: int = 0

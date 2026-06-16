@@ -18,3 +18,4 @@ class BrainContext:
     task_id: str
     llm_config: LLMConfig
     offline_mode: bool = False
+    token_budget: int = 0  # 任务级 token 预算上限；0 表示不限

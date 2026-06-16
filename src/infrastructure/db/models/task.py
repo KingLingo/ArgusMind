@@ -20,6 +20,8 @@ class Task(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     offline_mode: Mapped[bool] = mapped_column(default=False, nullable=False)
     enable_sink_finder: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # 任务级 token 预算上限（输入+输出累计）；0 表示不限。超额时任务自动暂停。
+    token_budget: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     todo: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSONB, default=list, nullable=True)
     error: Mapped[str] = mapped_column(Text, default="", nullable=False)

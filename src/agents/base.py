@@ -17,7 +17,7 @@ from src.agents.brain import Brain
 from src.agents.tool_output_limit import limit_tool_result
 from src.core.event_bus import get_event_bus
 from src.core.events import LogEvent
-from src.core.task_control import ensure_task_running
+from src.core.task_control import ensure_task_running, TaskPausedError
 from src.llm import LLMError
 from src.tools.base import ERROR_CODE_CANCELLED
 
@@ -231,6 +231,10 @@ class BaseAgent:
                     "ERROR",
                     f"[{self._agent_tag}] LLM 调用发生致命错误，终止当前流程（任务将标记为失败）",
                 )
+                raise
+            except TaskPausedError:
+                # 任务被暂停（含 token 预算超额自动暂停）：必须协作式向上抛出，
+                # 不可被下方通用 except 吞成"空响应"后继续。
                 raise
             except ValueError as e:
                 conversation.append({"role": "assistant", "content": "(模型返回内容无法解析为JSON)"})

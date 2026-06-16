@@ -8,6 +8,8 @@ declare namespace API {
     offline_mode?: boolean;
     /** Enable SinkFinder - find dangerous functions + chain analysis, time-consuming */
     enable_sink_finder?: boolean;
+    /** Token Budget - pause task when cumulative tokens reach this cap; 0 means unlimited */
+    token_budget?: number;
   };
 
   type BodyCreateProjectApiProjectsPost = {

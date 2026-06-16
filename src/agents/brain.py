@@ -53,6 +53,12 @@ class Brain:
         self.task_id = context.task_id
         self.offline_mode = context.offline_mode
 
+        # 任务级 token 预算（0=不限）。_token_delta 为本实例累计用量，
+        # _token_seed 为账本基线（惰性求和，保证任务恢复后能接续计量）。
+        self.token_budget = int(getattr(context, "token_budget", 0) or 0)
+        self._token_delta = 0
+        self._token_seed = None
+
         # 脱机模式：不初始化 LLMClient（避免 litellm 依赖）
         if context.offline_mode:
             self.llm = None
@@ -176,6 +182,42 @@ class Brain:
             logger.log(getattr(logging, level.upper(), logging.INFO), "[%s] %s", self.DEFAULT_MODULE, message)
 
     # ---------------- LLM / 工具调用 ----------------
+    def tokens_used_total(self) -> int:
+        """任务累计 token 用量（账本基线 + 本实例增量）。预算关闭时返回 0。"""
+        if self.token_budget <= 0:
+            return 0
+        if self._token_seed is None:
+            # 惰性从账本求和一次，作为基线（任务恢复时此前已消耗的 token）
+            try:
+                from src.infrastructure.db import session_scope
+                from src.services.token_service import sum_task_tokens_from_ledger
+                with session_scope() as session:
+                    li, lo, ci, co = sum_task_tokens_from_ledger(session, self.task_id)
+                self._token_seed = int(li) + int(lo) + int(ci) + int(co)
+            except Exception:  # pragma: no cover - 求和失败不应阻断审计
+                self._token_seed = 0
+        return self._token_seed + self._token_delta
+
+    def _enforce_token_budget(self) -> None:
+        """超出 token 预算时，暂停任务并抛 TokenBudgetExceededError。"""
+        if self.token_budget <= 0:
+            return
+        used = self.tokens_used_total()
+        if used < self.token_budget:
+            return
+        from src.core.task_control import get_task_control, TokenBudgetExceededError
+        get_task_control().set_paused(self.task_id)
+        self._bus.publish(LogEvent(
+            level="WARNING", module=self.module_name,
+            message=f"已达 token 预算上限（{used}/{self.token_budget}），任务自动暂停",
+            task_id=self.task_id,
+        ))
+        self._bus.publish(TaskStatusEvent(
+            task_id=self.task_id, status="paused",
+            message=f"token 预算超额：{used}/{self.token_budget}",
+        ))
+        raise TokenBudgetExceededError(self.task_id, used, self.token_budget)
+
     def ask(
         self,
         messages: List[Dict[str, str]],
@@ -189,7 +231,12 @@ class Brain:
         if self.llm is None:
             raise RuntimeError("[Brain] 脱机模式下不支持 LLM 调用")
 
+        # 调用前检查 token 预算，超额则暂停任务（协作式退出）
+        self._enforce_token_budget()
+
         resp = self.llm.call(messages)
+        # 累计本次用量，供下一次调用前的预算判断
+        self._token_delta += (resp.prompt_tokens or 0) + (resp.completion_tokens or 0)
         parsed = parse_json(resp.content)
         if not isinstance(parsed, dict):
             logger.warning(

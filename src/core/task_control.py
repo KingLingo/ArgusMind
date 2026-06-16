@@ -20,6 +20,21 @@ class TaskPausedError(Exception):
         super().__init__(f"任务 {task_id} 已暂停")
 
 
+class TokenBudgetExceededError(TaskPausedError):
+    """任务累计 token 已达预算上限，按"暂停"语义协作式退出。
+
+    继承 ``TaskPausedError``，使编排层既有的 ``except TaskPausedError`` 分支
+    无需改动即可优雅停下（不标记 failed）；上调预算后可恢复继续。
+    """
+
+    def __init__(self, task_id: str, used: int, budget: int) -> None:
+        self.task_id = task_id
+        self.used = used
+        self.budget = budget
+        # 跳过父类的固定文案，给出预算上下文
+        Exception.__init__(self, f"任务 {task_id} 已达 token 预算上限：{used}/{budget}")
+
+
 class TaskControlRegistry:
     """线程安全的任务暂停/停止注册表（单进程）。"""
 
