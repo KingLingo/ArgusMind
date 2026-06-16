@@ -27,6 +27,8 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "PyYAML>=6.0",
+    "openpyxl>=3.1.0",   # 漏洞导出 Excel
+    "reportlab>=4.0.0",  # 漏洞导出 PDF（内置 STSong-Light 中文 CID 字体，无需系统字体）
 ]
 
 [project.optional-dependencies]

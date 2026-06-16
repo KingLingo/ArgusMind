@@ -17,7 +17,16 @@ from src.schemas.vulnerability import FindingFilter
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_FORMATS = ("xlsx", "csv", "md", "markdown", "sarif", "json")
+SUPPORTED_FORMATS = ("xlsx", "csv", "md", "markdown", "sarif", "json", "pdf")
+
+# 严重等级 → 展示颜色（PDF/标签）
+_LEVEL_COLOR = {
+    "CRITICAL": "#a8071a",
+    "HIGH": "#d4380d",
+    "MEDIUM": "#d46b08",
+    "LOW": "#389e0d",
+    "INFO": "#8c8c8c",
+}
 
 # 严重等级 → SARIF level
 _SARIF_LEVEL = {
@@ -282,6 +291,123 @@ def to_sarif(findings: List[Dict[str, Any]]) -> bytes:
     return json.dumps(sarif, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+def to_pdf(findings: List[Dict[str, Any]]) -> bytes:
+    """生成 PDF 报告。使用 reportlab 内置 STSong-Light CID 字体渲染中文，无需系统字体。"""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.platypus import (
+            Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, Preformatted,
+        )
+    except ImportError as e:  # pragma: no cover
+        raise ValueError("PDF 导出需要 reportlab，请先安装：pip install reportlab") from e
+
+    from xml.sax.saxutils import escape
+
+    font = "STSong-Light"
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont(font))
+    except Exception:  # pragma: no cover - 极端环境下回退默认字体
+        font = "Helvetica"
+
+    base = getSampleStyleSheet()
+    title_style = ParagraphStyle("AMTitle", parent=base["Title"], fontName=font, fontSize=20)
+    h2 = ParagraphStyle("AMH2", parent=base["Heading2"], fontName=font, fontSize=13, spaceBefore=10)
+    normal = ParagraphStyle("AMBody", parent=base["BodyText"], fontName=font, fontSize=9, leading=13)
+    small = ParagraphStyle("AMSmall", parent=normal, fontSize=8, textColor=colors.HexColor("#595959"))
+    code_style = ParagraphStyle("AMCode", parent=normal, fontName="Courier", fontSize=8,
+                                backColor=colors.HexColor("#f5f5f5"), leftIndent=4, leading=11)
+
+    def _p(text: str, style=normal) -> Paragraph:
+        return Paragraph(escape(str(text or "")).replace("\n", "<br/>"), style)
+
+    story: List[Any] = []
+    story.append(Paragraph("ArgusMind 漏洞审计报告", title_style))
+    story.append(Spacer(1, 4 * mm))
+
+    # 概览表
+    counts: Dict[str, int] = {}
+    for f in findings:
+        counts[f.get("level") or "UNKNOWN"] = counts.get(f.get("level") or "UNKNOWN", 0) + 1
+    story.append(_p(f"共 {len(findings)} 条发现", small))
+    order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    rows = [["等级", "数量"]]
+    for lv in order:
+        if counts.get(lv):
+            rows.append([lv, str(counts[lv])])
+    for lv, n in counts.items():
+        if lv not in order:
+            rows.append([lv, str(n)])
+    if len(rows) > 1:
+        t = Table(rows, colWidths=[60 * mm, 30 * mm])
+        t.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), font),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fafafa")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d9d9d9")),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ]))
+        story.append(Spacer(1, 2 * mm))
+        story.append(t)
+
+    # 明细
+    story.append(Paragraph("漏洞明细", h2))
+    for i, f in enumerate(findings, 1):
+        level = f.get("level") or "N/A"
+        color = _LEVEL_COLOR.get(level, "#595959")
+        story.append(Paragraph(
+            f'{i}. {escape(str(f.get("vul_name") or "(未命名)"))} '
+            f'<font color="{color}">[{level}]</font>',
+            ParagraphStyle("AMItem", parent=h2, fontSize=11, spaceBefore=8),
+        ))
+        loc = f.get("file") or ""
+        if loc and f.get("line"):
+            loc = f"{loc}:{f['line']}"
+        meta_rows = [
+            ["类型", f.get("category_name") or "-", "判定", f.get("verdict") or "-"],
+            ["来源", f.get("source") or "-", "置信度", f.get("confidence") or "-"],
+            ["位置", loc or "-", "状态", f.get("status") or "-"],
+            ["CWE", f.get("cwe") or "-", "OWASP", f.get("owasp") or "-"],
+            ["CVE", f.get("cve") or "-", "CVSS", f.get("cvss_score") or "-"],
+        ]
+        mt = Table(
+            [[_p(c, small) for c in r] for r in meta_rows],
+            colWidths=[18 * mm, 67 * mm, 18 * mm, 67 * mm],
+        )
+        mt.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#eeeeee")),
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#fafafa")),
+            ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#fafafa")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(mt)
+        if f.get("detail"):
+            story.append(_p("<b>描述</b>", small))
+            story.append(_p(f["detail"]))
+        if f.get("code_snippet"):
+            story.append(_p("<b>相关代码</b>", small))
+            snippet = str(f["code_snippet"])[:1500]
+            story.append(Preformatted(snippet, code_style))
+        if f.get("remediation"):
+            story.append(_p("<b>修复建议</b>", small))
+            story.append(_p(f["remediation"]))
+        story.append(Spacer(1, 3 * mm))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
+        title="ArgusMind 漏洞审计报告",
+    )
+    doc.build(story)
+    return buf.getvalue()
+
+
 def to_xlsx(findings: List[Dict[str, Any]]) -> bytes:
     from openpyxl import Workbook
 
@@ -303,6 +429,7 @@ _DISPATCH = {
     "markdown": (to_markdown, "text/markdown; charset=utf-8", "vulnerabilities.md"),
     "sarif": (to_sarif, "application/sarif+json", "vulnerabilities.sarif"),
     "json": (to_json, "application/json; charset=utf-8", "vulnerabilities.json"),
+    "pdf": (to_pdf, "application/pdf", "vulnerabilities.pdf"),
 }
 
 
