@@ -161,6 +161,40 @@ def _map_semgrep_severity(severity: str) -> str:
     return mapping.get(severity, "medium")
 
 
+def _map_trivy_severity(severity: str) -> str:
+    """Trivy 严重度 (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN) → 内部等级。"""
+    mapping = {
+        "CRITICAL": "critical", "HIGH": "high",
+        "MEDIUM": "medium", "LOW": "low", "UNKNOWN": "low",
+    }
+    return mapping.get((severity or "").upper(), "medium")
+
+
+def _map_osv_severity(severity: str) -> str:
+    """OSV database_specific.severity → 内部等级。"""
+    mapping = {
+        "CRITICAL": "critical", "HIGH": "high",
+        "MODERATE": "medium", "MEDIUM": "medium", "LOW": "low",
+    }
+    return mapping.get((severity or "").upper(), "medium")
+
+
+def _rel_under(path: str, project_root: str) -> str:
+    """尽力把绝对路径转为相对项目根的路径；非路径(如包名)原样返回。"""
+    if not path:
+        return ""
+    try:
+        if os.path.isabs(path):
+            return os.path.relpath(path, project_root).replace("\\", "/")
+    except Exception:
+        pass
+    return path.replace("\\", "/")
+
+
+def _cvss_by_severity(severity: str) -> float:
+    return {"critical": 9.5, "high": 8.5, "medium": 5.5, "low": 3.0}.get(severity, 5.5)
+
+
 def _extract_cwe(message: str) -> str:
     """从消息中提取 CWE 编号。"""
     import re
@@ -197,6 +231,9 @@ class ExternalToolService:
             "gitleaks": "gitleaks version",
             "bandit": "bandit --version",
             "semgrep": "semgrep --version",
+            "trivy": "trivy --version",
+            "osv-scanner": "osv-scanner --version",
+            "trufflehog": "trufflehog --version",
         }
         command = check_commands.get(tool_name)
         if not command:
@@ -209,7 +246,7 @@ class ExternalToolService:
 
     def check_all_tools(self) -> Dict[str, bool]:
         """检查所有工具安装状态。"""
-        for tool in ("gitleaks", "bandit", "semgrep"):
+        for tool in ("gitleaks", "bandit", "semgrep", "trivy", "osv-scanner", "trufflehog"):
             if tool not in self._tool_status:
                 self.check_tool_installed(tool)
         return dict(self._tool_status)
@@ -375,6 +412,196 @@ class ExternalToolService:
 
         return findings
 
+    def scan_with_trivy(self, project_root: str) -> List[Dict[str, Any]]:
+        """使用 Trivy 扫描依赖漏洞(SCA)/密钥/配置错误。"""
+        findings: List[Dict[str, Any]] = []
+
+        if not self.check_tool_installed("trivy"):
+            logger.info("Trivy 未安装，跳过依赖与配置扫描")
+            return findings
+
+        with tempfile.TemporaryDirectory(prefix="trivy-") as temp_dir:
+            report_path = os.path.join(temp_dir, "report.json")
+            command = (
+                f'trivy fs --quiet --format json --scanners vuln,secret,misconfig '
+                f'--output "{report_path}" "{project_root}"'
+            )
+            # 首次运行可能需联网下载漏洞库，放宽超时
+            _run_command(command, timeout=600)
+
+            if not os.path.isfile(report_path):
+                return findings
+            try:
+                with open(report_path, "r", encoding="utf-8") as f:
+                    report = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Trivy 报告解析失败: {e}")
+                return findings
+
+            for res in report.get("Results", []) or []:
+                target = _rel_under(res.get("Target", ""), project_root)
+                # 依赖漏洞
+                for v in res.get("Vulnerabilities", []) or []:
+                    severity = _map_trivy_severity(v.get("Severity", "MEDIUM"))
+                    pkg = v.get("PkgName", "")
+                    cwe = (v.get("CweIDs") or ["CWE-1395"])[0]
+                    fixed = v.get("FixedVersion", "")
+                    findings.append({
+                        "source": "external_tool",
+                        "tool_name": "Trivy",
+                        "vuln_id": v.get("VulnerabilityID", ""),
+                        "title": f"依赖组件存在已知漏洞：{pkg} {v.get('InstalledVersion', '')}",
+                        "severity": severity,
+                        "confidence": 0.9,
+                        "location": target,
+                        "file": target,
+                        "line": 1,
+                        "vuln_type": "VULNERABLE_DEPENDENCY",
+                        "cwe": cwe,
+                        "cve": v.get("VulnerabilityID", ""),
+                        "language": "dependency",
+                        "gbt_mapping": "GB/T38674-2020 使用含已知漏洞的组件",
+                        "cvss_score": _cvss_by_severity(severity),
+                        "evidence": f"{pkg}@{v.get('InstalledVersion', '')} 命中 {v.get('VulnerabilityID', '')}："
+                                    f"{v.get('Title', '') or v.get('Description', '')[:200]}",
+                        "impact_description": v.get("Description", "")[:500],
+                        "remediation": f"升级 {pkg} 至 {fixed}" if fixed else f"关注 {pkg} 官方安全公告并尽快升级",
+                        "code_snippet": f"{pkg} {v.get('InstalledVersion', '')}",
+                        "status": "待验证",
+                    })
+                # 密钥
+                for s in res.get("Secrets", []) or []:
+                    findings.append({
+                        "source": "external_tool",
+                        "tool_name": "Trivy",
+                        "vuln_id": s.get("RuleID", "SECRET"),
+                        "title": f"发现敏感信息：{s.get('Title', s.get('RuleID', ''))}",
+                        "severity": _map_trivy_severity(s.get("Severity", "HIGH")),
+                        "confidence": 0.85,
+                        "location": f"{target}:{s.get('StartLine', 1)}",
+                        "file": target,
+                        "line": s.get("StartLine", 1),
+                        "vuln_type": "HARD_CODED_SECRET",
+                        "cwe": "CWE-798",
+                        "language": "unknown",
+                        "gbt_mapping": "GB/T39412-6.1.1.10 硬编码敏感信息",
+                        "cvss_score": 8.5,
+                        "evidence": f"在 {target}:{s.get('StartLine', 1)} 发现 {s.get('RuleID', '')} 类型敏感信息",
+                        "impact_description": "可能导致未授权访问、数据泄露",
+                        "remediation": "移除硬编码密钥，改用环境变量或密钥管理服务",
+                        "code_snippet": s.get("Match", ""),
+                        "status": "待验证",
+                    })
+
+        return findings
+
+    def scan_with_osv(self, project_root: str) -> List[Dict[str, Any]]:
+        """使用 osv-scanner 扫描依赖项已知漏洞(OSV 数据库)。"""
+        findings: List[Dict[str, Any]] = []
+
+        if not self.check_tool_installed("osv-scanner"):
+            logger.info("osv-scanner 未安装，跳过 OSV 依赖扫描")
+            return findings
+
+        # osv-scanner 发现漏洞时退出码为 1，结果输出到 stdout
+        command = f'osv-scanner --format json -r "{project_root}"'
+        result = _run_command(command, timeout=300)
+        stdout = (result.get("stdout") or "").strip()
+        if not stdout:
+            return findings
+        try:
+            report = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            logger.warning(f"osv-scanner 报告解析失败: {e}")
+            return findings
+
+        for res in report.get("results", []) or []:
+            src_path = _rel_under((res.get("source") or {}).get("path", ""), project_root)
+            for pkg in res.get("packages", []) or []:
+                pinfo = pkg.get("package", {}) or {}
+                pkg_name = pinfo.get("name", "")
+                pkg_ver = pinfo.get("version", "")
+                for v in pkg.get("vulnerabilities", []) or []:
+                    db_sev = (v.get("database_specific") or {}).get("severity", "")
+                    severity = _map_osv_severity(db_sev) if db_sev else "medium"
+                    osv_id = v.get("id", "")
+                    aliases = ", ".join(v.get("aliases", []) or [])
+                    findings.append({
+                        "source": "external_tool",
+                        "tool_name": "osv-scanner",
+                        "vuln_id": osv_id,
+                        "title": f"依赖组件存在已知漏洞：{pkg_name} {pkg_ver}",
+                        "severity": severity,
+                        "confidence": 0.9,
+                        "location": src_path,
+                        "file": src_path,
+                        "line": 1,
+                        "vuln_type": "VULNERABLE_DEPENDENCY",
+                        "cwe": "CWE-1395",
+                        "cve": aliases or osv_id,
+                        "language": pinfo.get("ecosystem", "dependency"),
+                        "gbt_mapping": "GB/T38674-2020 使用含已知漏洞的组件",
+                        "cvss_score": _cvss_by_severity(severity),
+                        "evidence": f"{pkg_name}@{pkg_ver} 命中 {osv_id}：{v.get('summary', '')[:200]}",
+                        "impact_description": (v.get("details") or v.get("summary") or "")[:500],
+                        "remediation": f"升级 {pkg_name} 至不受影响的版本（参考 {osv_id}）",
+                        "code_snippet": f"{pkg_name} {pkg_ver}",
+                        "status": "待验证",
+                    })
+
+        return findings
+
+    def scan_with_trufflehog(self, project_root: str) -> List[Dict[str, Any]]:
+        """使用 TruffleHog 扫描密钥（支持可验证密钥）。输出为 JSONL。"""
+        findings: List[Dict[str, Any]] = []
+
+        if not self.check_tool_installed("trufflehog"):
+            logger.info("TruffleHog 未安装，跳过密钥扫描")
+            return findings
+
+        command = f'trufflehog filesystem "{project_root}" --json --no-update'
+        result = _run_command(command, timeout=300)
+        stdout = result.get("stdout") or ""
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line or line[0] != "{":
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            meta = (((item.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {})
+            file_path = _rel_under(meta.get("file", ""), project_root)
+            if not file_path:
+                continue
+            line_no = meta.get("line", 1) or 1
+            verified = bool(item.get("Verified"))
+            detector = item.get("DetectorName", "unknown")
+            findings.append({
+                "source": "external_tool",
+                "tool_name": "TruffleHog",
+                "vuln_id": f"SECRET_{detector}",
+                "title": f"发现{'已验证' if verified else '疑似'}敏感信息：{detector}",
+                "severity": "critical" if verified else "high",
+                "confidence": 0.98 if verified else 0.8,
+                "location": f"{file_path}:{line_no}",
+                "file": file_path,
+                "line": line_no,
+                "vuln_type": "HARD_CODED_SECRET",
+                "cwe": "CWE-798",
+                "language": "unknown",
+                "gbt_mapping": "GB/T39412-6.1.1.10 硬编码敏感信息",
+                "cvss_score": 9.0 if verified else 8.0,
+                "evidence": f"在 {file_path}:{line_no} 发现 {detector} 密钥"
+                            f"（{'已联网验证有效' if verified else '未验证'}）",
+                "impact_description": "可能导致未授权访问、数据泄露或系统被入侵",
+                "remediation": "立即吊销并轮换该密钥，移除硬编码，改用密钥管理服务",
+                "code_snippet": item.get("Redacted", "") or "(已脱敏)",
+                "status": "待验证",
+            })
+
+        return findings
+
     def scan_all(self, project_root: str) -> List[Dict[str, Any]]:
         """执行所有已安装工具的扫描（并行执行，减少总耗时）。"""
         tool_status = self.check_all_tools()
@@ -387,6 +614,12 @@ class ExternalToolService:
             tasks.append(("Bandit", self.scan_with_bandit))
         if tool_status.get("semgrep"):
             tasks.append(("Semgrep", self.scan_with_semgrep))
+        if tool_status.get("trivy"):
+            tasks.append(("Trivy", self.scan_with_trivy))
+        if tool_status.get("osv-scanner"):
+            tasks.append(("osv-scanner", self.scan_with_osv))
+        if tool_status.get("trufflehog"):
+            tasks.append(("TruffleHog", self.scan_with_trufflehog))
 
         if not tasks:
             return []

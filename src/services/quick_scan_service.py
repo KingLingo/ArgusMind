@@ -860,7 +860,17 @@ class QuickScanService:
         # 配置文件扫描（yml/yaml/xml/properties 中的硬编码凭据）
         config_findings = self._scan_config_files(project_root, file_list)
 
-        combined = active_findings + component_findings + config_findings
+        # 外部工具扫描（Gitleaks/Bandit/Semgrep/Trivy/osv-scanner/TruffleHog；
+        # 仅运行已安装的工具，未安装则跳过；失败不影响规则扫描结果）
+        external_findings: List[Dict[str, Any]] = []
+        try:
+            from src.services.external_tool_service import ExternalToolService
+            external_findings = ExternalToolService().scan_all(project_root)
+        except Exception as e:  # pragma: no cover - 外部工具不可用时降级
+            import logging
+            logging.getLogger(__name__).warning("外部工具扫描失败，已跳过: %s", e)
+
+        combined = active_findings + component_findings + config_findings + external_findings
 
         return {
             "findings": combined,
@@ -869,6 +879,7 @@ class QuickScanService:
                 "total_findings": len(combined),
                 "code_findings": len(active_findings),
                 "component_findings": len(component_findings),
+                "external_tool_findings": len(external_findings),
                 "suppressed_findings": len(deduped) - len(active_findings),
             },
         }
