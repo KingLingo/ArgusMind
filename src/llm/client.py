@@ -67,11 +67,13 @@ _NATIVE_PROVIDERS = frozenset({
     "sagemaker", "moonshot", "volcengine",
 })
 
-# 视为 "OpenAI 兼容端点" 的 type 取值（配置管理里可显式指定）。
-# 注意：不含裸 "openai"（有歧义，可能只是厂商名）；真正的兼容代理场景
-# 由 "base_url + 非原生 provider" 的启发式兜底。
+# 视为 "OpenAI 兼容端点" 的 type 取值（配置管理里可显式指定 / 用开关强制）。
+# 注意：
+#   - 不含裸 "openai"（有歧义，可能只是厂商名）；
+#   - 不含 "custom"：自定义端点默认走下方 "base_url + 非原生 provider" 的启发式判定，
+#     仅当用户在 UI 显式打开 "OpenAI 兼容端点" 开关（写入 openai_compatible）时才强制兼容路由。
 _COMPATIBLE_TYPES = frozenset({
-    "openai_compatible", "compatible", "custom", "oneapi",
+    "openai_compatible", "compatible", "oneapi",
     "one-api", "new-api", "newapi", "proxy",
 })
 

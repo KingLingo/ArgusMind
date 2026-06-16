@@ -3,6 +3,7 @@ import {
   ProForm,
   ProFormDependency,
   ProFormSelect,
+  ProFormSwitch,
   ProFormText,
 } from '@ant-design/pro-components';
 import { Alert, AutoComplete, Button, Card, Modal, message, Spin, Tabs } from 'antd';
@@ -483,7 +484,14 @@ const AiSettingsPage: React.FC = () => {
                           LLM_baseurl: isCustomProvider
                             ? values.LLM_custom_baseurl
                             : config.llm.LLM_baseurl || '',
-                          type: isCustomProvider ? 'custom' : PRESET_LLM_TYPE,
+                          // 自定义端点：开关开启 → openai_compatible（强制 OpenAI 兼容路由，
+                          // 适配 one-api/new-api 等聚合代理）；关闭 → custom（由后端按
+                          // base_url + provider 启发式自动判定）
+                          type: isCustomProvider
+                            ? (values.LLM_openai_compatible === false
+                                ? 'custom'
+                                : 'openai_compatible')
+                            : PRESET_LLM_TYPE,
                         };
                         payload.LLM_key = isCustomProvider
                           ? values.LLM_custom_key
@@ -558,6 +566,13 @@ const AiSettingsPage: React.FC = () => {
                                 label="自定义 Base URL"
                                 placeholder="https://example.com/v1"
                                 rules={[{ required: true }]}
+                              />
+                              <ProFormSwitch
+                                name="LLM_openai_compatible"
+                                label="OpenAI 兼容端点"
+                                tooltip="开启后强制以 OpenAI 兼容方式调用此端点（custom_llm_provider=openai），适配 one-api / new-api 等聚合代理或任意 OpenAI 兼容服务；关闭则由系统按 Base URL 与 Provider 自动判定。自建/代理调不通时建议开启。"
+                                initialValue={config.llm.type !== 'custom'}
+                                fieldProps={{ defaultChecked: true }}
                               />
                               <ProFormText
                                 name="LLM_custom_key"
