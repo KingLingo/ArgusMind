@@ -83,7 +83,12 @@ def list_findings(
     return PageResult[FindingListItem](data=[FindingListItem.model_validate(r) for r in rows], total=total)
 
 
-@router.get("/export", summary="导出漏洞列表为 Excel")
+@router.get(
+    "/export",
+    summary="导出漏洞列表（Excel/CSV/Markdown/SARIF/JSON）",
+    description="通过 format 选择导出格式：xlsx(默认) / csv / md / sarif / json。"
+                "SARIF 可直接用于 GitHub Code Scanning 或 CI 集成。",
+)
 def export_findings(
     project_id: Optional[str] = Query(None),
     task_id: Optional[str] = Query(None),
@@ -91,14 +96,13 @@ def export_findings(
     severity: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
+    format: str = Query("xlsx", description="导出格式: xlsx/csv/md/sarif/json"),
     limit: int = Query(5000, ge=1, le=5000, description="最大导出条数"),
 ):
-    from io import BytesIO
-    from openpyxl import Workbook
+    from fastapi.responses import Response
 
-    from src.repositories.vulnerability_repository import VulnerabilityRepository
-    from src.infrastructure.db import session_scope
-    from src.infrastructure.db.models import Vulnerability, VulnerabilityDetail
+    from src.api.exceptions import AppException
+    from src.services import finding_export_service
 
     flt = FindingFilter(
         project_id=project_id,
@@ -108,38 +112,15 @@ def export_findings(
         status=status,
         source=source,
     )
-    with session_scope() as session:
-        rows, _ = VulnerabilityRepository(session).list(
-            project_id=flt.project_id,
-            task_id=flt.task_id,
-            keyword=flt.keyword,
-            severity=flt.severity,
-            status=flt.status,
-            source=flt.source,
-            current=1,
-            page_size=limit,
-        )
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "漏洞列表"
-        ws.append(["ID", "漏洞名称", "等级", "判定", "来源", "状态", "二次校验", "置信度", "文件位置", "CWE", "创建时间"])
-        for r in rows:
-            ep = str(getattr(r.detail, "entry_points", "")) if r.detail else ""
-            cwe = str(getattr(r.detail, "cwe", "")) if r.detail else ""
-            ws.append([
-                r.id, r.vul_name, r.level, r.verdict, r.source, r.status,
-                r.verification_status, r.confidence, ep, cwe,
-                r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
-            ])
-        buf = BytesIO()
-        wb.save(buf)
-        buf.seek(0)
+    try:
+        content, media_type, filename = finding_export_service.build_export(format, flt, limit=limit)
+    except ValueError as e:
+        raise AppException(str(e))
 
-    from fastapi.responses import Response
     return Response(
-        content=buf.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=vulnerabilities.xlsx"},
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
