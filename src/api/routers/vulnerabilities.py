@@ -91,6 +91,7 @@ def export_findings(
     severity: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
+    limit: int = Query(5000, ge=1, le=5000, description="最大导出条数"),
 ):
     from io import BytesIO
     from openpyxl import Workbook
@@ -116,7 +117,7 @@ def export_findings(
             status=flt.status,
             source=flt.source,
             current=1,
-            page_size=10000,
+            page_size=limit,
         )
         wb = Workbook()
         ws = wb.active

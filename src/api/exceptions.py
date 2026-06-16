@@ -1,12 +1,15 @@
 """自定义异常 + FastAPI 异常处理器"""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger(__name__)
 
 
 class AppException(Exception):

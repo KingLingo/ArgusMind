@@ -1,7 +1,7 @@
 """任务应用服务"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 from src.infrastructure.db import session_scope

@@ -47,7 +47,7 @@ def _inject_token_usage(task: Any, session=None) -> TaskRead:
         else:
             _fill_token_usage(session, task, data)
     except Exception:
-        pass
+        logger.warning("填充 token 用量失败 task_id=%s", task.id, exc_info=True)
     return data
 
 

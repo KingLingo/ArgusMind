@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Query
 
 import src.storage.manager as db_manager
-from src.api.exceptions import AppException
+from src.api.exceptions import AppException, NotFoundError
 from src.api.security import CurrentUserDep
 from src.infrastructure.db import session_scope
 from src.infrastructure.db.models import Vulnerability
