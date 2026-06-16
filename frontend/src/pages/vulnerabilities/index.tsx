@@ -2,7 +2,7 @@ import { BugOutlined, DownloadOutlined } from '@ant-design/icons';
 import type { ActionType, ProColumns, ProFormInstance } from '@ant-design/pro-components';
 import { PageContainer, ProTable } from '@ant-design/pro-components';
 import { history, useLocation } from '@umijs/max';
-import { Button, message, Popconfirm, Tag, Typography } from 'antd';
+import { Button, Dropdown, message, Popconfirm, Tag, Typography } from 'antd';
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { getProjectOptions } from '@/services/projects';
 import { getTaskOptions } from '@/services/tasks';
@@ -14,7 +14,10 @@ import {
   type VulnSeverity,
   type VulnStatus,
 } from '@/services/vulnerabilities';
-import { exportVulnerabilities } from '@/services/vulnerabilities';
+import {
+  exportVulnerabilities,
+  type ExportFormat,
+} from '@/services/vulnerabilities';
 import { formatUtcForLocalDisplay } from '@/utils/utcDateTimeDisplay';
 import { useVulnerabilityPageStyles } from './vulnerabilityStyles';
 import {
@@ -356,25 +359,38 @@ const VulnerabilitiesPage: React.FC = () => {
         rowKey="id"
         scroll={{ x: 1320 }}
         form={{ initialValues: formInitialValues }}
-        toolBarRender={() => [
-          <Button
-            key="export"
-            icon={<DownloadOutlined />}
-            onClick={() => {
-              const form = formRef.current?.getFieldsValue?.();
-              exportVulnerabilities({
-                keyword: form?.keyword as string,
-                severity: form?.severity as VulnSeverity,
-                status: form?.status as VulnStatus,
-                source: form?.source as string,
-                projectId: form?.projectId as string,
-                taskId: form?.taskId as string,
-              });
-            }}
-          >
-            导出 Excel
-          </Button>,
-        ]}
+        toolBarRender={() => {
+          const doExport = (format: ExportFormat) => {
+            const form = formRef.current?.getFieldsValue?.();
+            exportVulnerabilities({
+              keyword: form?.keyword as string,
+              severity: form?.severity as VulnSeverity,
+              status: form?.status as VulnStatus,
+              source: form?.source as string,
+              projectId: form?.projectId as string,
+              taskId: form?.taskId as string,
+              format,
+            });
+          };
+          return [
+            <Dropdown
+              key="export"
+              menu={{
+                items: [
+                  { key: 'xlsx', label: 'Excel (.xlsx)' },
+                  { key: 'csv', label: 'CSV (.csv)' },
+                  { key: 'md', label: 'Markdown (.md)' },
+                  { key: 'pdf', label: 'PDF (.pdf)' },
+                  { key: 'sarif', label: 'SARIF (CI/代码扫描)' },
+                  { key: 'json', label: 'JSON (.json)' },
+                ],
+                onClick: ({ key }) => doExport(key as ExportFormat),
+              }}
+            >
+              <Button icon={<DownloadOutlined />}>导出</Button>
+            </Dropdown>,
+          ];
+        }}
         search={{
           labelWidth: 'auto',
           defaultCollapsed: false,

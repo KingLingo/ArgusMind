@@ -294,6 +294,17 @@ export async function deleteVulnerability(findingId: string) {
   );
 }
 
+export type ExportFormat = 'xlsx' | 'csv' | 'md' | 'sarif' | 'json' | 'pdf';
+
+const EXPORT_EXT: Record<ExportFormat, string> = {
+  xlsx: 'xlsx',
+  csv: 'csv',
+  md: 'md',
+  sarif: 'sarif',
+  json: 'json',
+  pdf: 'pdf',
+};
+
 export function exportVulnerabilities(params: {
   keyword?: string;
   severity?: VulnSeverity;
@@ -301,7 +312,9 @@ export function exportVulnerabilities(params: {
   source?: string;
   projectId?: string;
   taskId?: string;
+  format?: ExportFormat;
 }) {
+  const fmt: ExportFormat = params.format ?? 'xlsx';
   const query = new URLSearchParams();
   if (params.keyword) query.set('keyword', params.keyword);
   if (params.severity) query.set('severity', params.severity);
@@ -309,6 +322,7 @@ export function exportVulnerabilities(params: {
   if (params.source) query.set('source', params.source);
   if (params.projectId) query.set('project_id', params.projectId);
   if (params.taskId) query.set('task_id', params.taskId);
+  query.set('format', fmt);
 
   request(`/api/findings/export?${query.toString()}`, {
     responseType: 'blob',
@@ -317,7 +331,7 @@ export function exportVulnerabilities(params: {
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;
-    a.download = `vulnerabilities-${Date.now()}.xlsx`;
+    a.download = `vulnerabilities-${Date.now()}.${EXPORT_EXT[fmt]}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
