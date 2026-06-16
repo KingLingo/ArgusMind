@@ -115,6 +115,9 @@ def get_llm_runtime_config() -> Optional[LLMConfig]:
         model=model,
         type=tp,
         base_url=cfg.get("LLM_baseurl") or None,
+        # Azure 等需要 api_version；此前未透传，导致这类端点调不通
+        api_version=(cfg.get("LLM_api_version") or cfg.get("api_version") or None),
+        azure_endpoint=(cfg.get("LLM_azure_endpoint") or cfg.get("azure_endpoint") or None),
     )
 
 

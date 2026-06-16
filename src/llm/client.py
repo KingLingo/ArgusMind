@@ -54,6 +54,40 @@ _RETRYABLE_EXC_NAMES = frozenset({
     "RateLimitError",
 })
 
+# litellm 原生支持、需保留各自专有路由（专有 SDK / 鉴权 / 端点）的厂商。
+# 不在此列且配置了 base_url 的 provider（典型为 one-api / new-api / 各类自建聚合代理，
+# 或下拉里选了 litellm 不识别的国产厂商名）一律按 OpenAI 兼容端点处理，
+# 避免 litellm 报 "LLM Provider NOT provided" 或忽略 base_url 直连真实厂商。
+_NATIVE_PROVIDERS = frozenset({
+    "openai", "azure", "azure_ai", "anthropic", "bedrock", "vertex_ai", "vertex",
+    "gemini", "google", "palm", "cohere", "mistral", "ollama", "together_ai",
+    "groq", "deepseek", "xai", "openrouter", "fireworks_ai", "perplexity",
+    "anyscale", "replicate", "huggingface", "watsonx", "cloudflare", "voyage",
+    "databricks", "nvidia_nim", "deepinfra", "ai21", "nlp_cloud", "aleph_alpha",
+    "sagemaker", "moonshot", "volcengine",
+})
+
+# 视为 "OpenAI 兼容端点" 的 type 取值（配置管理里可显式指定）。
+# 注意：不含裸 "openai"（有歧义，可能只是厂商名）；真正的兼容代理场景
+# 由 "base_url + 非原生 provider" 的启发式兜底。
+_COMPATIBLE_TYPES = frozenset({
+    "openai_compatible", "compatible", "custom", "oneapi",
+    "one-api", "new-api", "newapi", "proxy",
+})
+
+
+def _litellm_native_providers() -> frozenset:
+    """合并静态白名单与 litellm 运行时 provider_list（若可用），尽量准确。"""
+    providers = set(_NATIVE_PROVIDERS)
+    try:  # litellm 不同版本里 provider_list 元素可能是字符串或枚举
+        for p in (getattr(litellm, "provider_list", None) or []):
+            name = getattr(p, "value", None) or str(p)
+            if name:
+                providers.add(name.lower())
+    except Exception:  # pragma: no cover - 仅作增强，失败回退到静态表
+        pass
+    return frozenset(providers)
+
 @dataclass
 class LLMResponse:
     """单次调用的返回：回复内容 + 本次对话消耗的 token"""
@@ -111,20 +145,52 @@ class LLMClient:
             raise ImportError("请安装 litellm: pip install litellm")
         self.config = config
 
+    def _is_openai_compatible(self, provider: str, api_base: Optional[str]) -> bool:
+        """是否应按 OpenAI 兼容端点调用。
+
+        判定优先级：
+        1) type 显式声明为兼容端点（openai_compatible/custom/oneapi 等）；
+        2) 配置了 base_url，但 provider 不在 litellm 原生白名单里（自建/聚合代理，
+           或下拉里选了 litellm 不识别的厂商名）。
+        """
+        tp = (self.config.type or "").strip().lower()
+        if tp in _COMPATIBLE_TYPES:
+            return True
+        if api_base and provider and provider.lower() not in _litellm_native_providers():
+            return True
+        return False
+
     def _litellm_kwargs(self, temperature: float = 0.7, max_tokens: Optional[int] = None, **kwargs) -> Dict:
         """从 config 构建 litellm completion 参数，不依赖环境变量"""
-        model = self.config.model
-        if "/" not in model and self.config.provider:
-            model = f"{self.config.provider}/{model}"
-        kw: Dict = {
-            "model": model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if self.config.api_key:
-            kw["api_key"] = self.config.api_key
+        provider = (self.config.provider or "").strip()
+        model = (self.config.model or "").strip()
         # base_url：自建或自定义端点；Azure 时也可用 azure_endpoint
         api_base = self.config.base_url or getattr(self.config, "azure_endpoint", None)
+        openai_compatible = self._is_openai_compatible(provider, api_base)
+
+        if openai_compatible:
+            # 兼容端点：原样使用配置的 model id（可能含 "/", 如聚合代理的 "org/model"），
+            # 仅去掉用户误加的 "openai/" 前缀，避免 "openai/openai/..."。
+            full_model = model[len("openai/"):] if model.startswith("openai/") else model
+        elif "/" in model:
+            full_model = model
+        elif provider:
+            full_model = f"{provider}/{model}"
+        else:
+            full_model = model
+
+        kw: Dict = {
+            "model": full_model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            # 自动丢弃目标端点不支持的参数（部分代理对 temperature/max_tokens 等会 400）
+            "drop_params": True,
+        }
+        if openai_compatible:
+            # 让 litellm 走 OpenAI 兼容客户端，直连 api_base，而非按品牌名解析路由
+            kw["custom_llm_provider"] = "openai"
+        if self.config.api_key:
+            kw["api_key"] = self.config.api_key
         if api_base and self.config.type != "builtin":
             kw["api_base"] = api_base
         if getattr(self.config, "api_version", None):
@@ -207,14 +273,29 @@ class LLMClient:
                     )
                     time.sleep(sleep_s)
                     continue
+                # 错误信息附带诊断上下文（model / api_base / provider，绝不含 api_key），
+                # 便于排查 "provider/代理调不通"：是路由没走对，还是端点不通。
+                diag = (
+                    f"model={litellm_kw.get('model')!r} "
+                    f"api_base={litellm_kw.get('api_base')!r} "
+                    f"custom_llm_provider={litellm_kw.get('custom_llm_provider')!r}"
+                )
                 raise LLMError(
-                    f"LLM 调用失败: {e}",
+                    f"LLM 调用失败: {e} [{diag}]",
                     original=e,
                     retryable=retryable,
                     status_code=status_code,
                 ) from e
 
-            content = response.choices[0].message.content or ""
+            # 边界保护：部分代理/网关异常时可能返回无 choices 或结构异常的响应，
+            # 直接索引 choices[0] 会抛 IndexError/AttributeError（裸异常、不可重试），
+            # 这里统一收敛为"空 content"分支，交由下方退避重试逻辑处理。
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                message = getattr(choices[0], "message", None)
+                content = (getattr(message, "content", None) or "") if message else ""
+            else:
+                content = ""
 
             # ------------------------------------------------------------
             # 空/异常的 LLM 响应检测
